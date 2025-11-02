@@ -25,7 +25,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 
 # ============================================================================
-# LANGCHAIN 1.0.3 IMPORTS (COMPATIBLE)
+# LANGCHAIN 1.0.3 IMPORTS 
 # ============================================================================
 
 # Core LangChain imports

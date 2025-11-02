@@ -1,53 +1,23 @@
 """
-Multimodal Chatbot with RAG System - Main Application (FIXED)
-
-This application provides a complete Retrieval-Augmented Generation (RAG)
-chatbot with support for both local and OpenAI models, document ingestion,
-and conversation management.
-
-Features:
-- Document ingestion from PDF, TXT, DOCX, Markdown
-- Semantic search with HuggingFace embeddings
-- RAG-powered responses with context
-- Multi-turn conversation support
-- Gradio web interface with proper message handling
-- Full .env configuration support
-- LangChain 1.0.3 compatible
-
-Author: Ashmin Dhungana
-License: MIT
+Multimodal Chatbot with RAG System - Main Application
 """
-
 import os
 import sys
 import logging
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
-
-# ============================================================================
-# LOGGING CONFIGURATION
-# ============================================================================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
-
-# ============================================================================
-# ENVIRONMENT SETUP
-# ============================================================================
-
-# Load .env configuration
 try:
     from dotenv import load_dotenv
     load_dotenv()
     logger.info("✅ .env file loaded")
 except ImportError:
-    logger.warning("⚠️  python-dotenv not installed, using environment variables only")
-
-# Read configuration from .env
+    logger.warning("⚠️ python-dotenv not installed")
 MODEL_TYPE = os.getenv("MODEL_TYPE", "hybrid")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
@@ -58,71 +28,60 @@ TOP_K = int(os.getenv("TOP_K", "5"))
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 VECTORSTORE_PATH = os.getenv("VECTORSTORE_PATH", "./vectorstore")
 GRADIO_PORT = int(os.getenv("GRADIO_PORT", "7860"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-logger.info(
-    f"📋 Configuration loaded:\n"
-    f"   MODEL_TYPE={MODEL_TYPE}\n"
-    f"   DEFAULT_MODEL={DEFAULT_MODEL}\n"
-    f"   TEMPERATURE={TEMPERATURE}\n"
-    f"   TOP_K={TOP_K}"
-)
-
+logger.info(f"📋 Config: MODEL_TYPE={MODEL_TYPE}, DEFAULT_MODEL={DEFAULT_MODEL}")
+# ============================================================================
+# MODEL DEFINITIONS - FIXED
+# ============================================================================
+# ✅ KEY FIX: Use actual model IDs in dropdown, not display names
+OPENAI_MODELS = [
+    ("gpt-3.5-turbo", "🚀 GPT-3.5 Turbo (Fast & Cheap)"),
+    ("gpt-4", "💎 GPT-4 (Most Capable)"),
+    ("gpt-4o-mini", "⚡ GPT-4o-mini (Fastest)"),
+]
+LOCAL_MODELS = [
+    ("mistralai/Mistral-7B-Instruct-v0.2", "⚡ Mistral 7B"),
+    ("meta-llama/Llama-2-7b-chat-hf", "🦙 Llama-2 7B"),
+    ("meta-llama/Llama-2-13b-chat-hf", "🦙 Llama-2 13B"),
+    ("tiiuae/falcon-7b-instruct", "🦅 Falcon 7B"),
+    ("EleutherAI/gpt-j-6B", "🔥 GPT-J 6B"),
+]
 # ============================================================================
 # COMPONENT IMPORTS
 # ============================================================================
-
 def safe_import(module_path: str, class_name: str):
-    """Safely import a class with error handling."""
     try:
         module = __import__(module_path, fromlist=[class_name])
         cls = getattr(module, class_name)
         logger.info(f"✅ Loaded: {class_name}")
         return cls
     except (ImportError, AttributeError) as e:
-        logger.warning(f"⚠️  Failed to load {class_name}: {str(e)}")
+        logger.warning(f"⚠️ Failed to load {class_name}: {str(e)}")
         return None
-
-# Import components
 logger.info("📦 Importing components...")
-
 RAGPipelineLCEL = safe_import("src.rag_pipeline", "RAGPipelineLCEL")
 LLMManager = safe_import("src.llm_models", "LLMManager")
 ConversationManager = safe_import("src.llm_models", "ConversationManager")
 DocumentLoader = safe_import("src.document_loader", "DocumentLoader")
-
-# ============================================================================
-# OPTIONAL COMPONENTS
-# ============================================================================
-
-# Try to import Gradio
 try:
     import gradio as gr
     gradio_available = True
     logger.info("✅ Gradio available")
 except ImportError:
     gradio_available = False
-    logger.warning("⚠️  Gradio not installed. Install via: pip install gradio")
-
-# Try to import embeddings for diagnostics
+    logger.warning("⚠️ Gradio not installed")
 try:
     from langchain_huggingface import HuggingFaceEmbeddings
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-    logger.info(f"✅ Embeddings initialized: {EMBEDDING_MODEL}")
+    logger.info(f"✅ Embeddings initialized")
 except Exception as e:
     logger.error(f"❌ Failed to initialize embeddings: {str(e)}")
     embeddings = None
-
 # ============================================================================
 # INITIALIZATION FUNCTIONS
 # ============================================================================
-
 def initialize_pipeline() -> Optional[object]:
-    """Initialize RAG pipeline."""
     if not RAGPipelineLCEL:
-        logger.error("❌ RAG Pipeline class not available")
         return None
-
     try:
         logger.info("🔄 Initializing RAG Pipeline...")
         pipeline = RAGPipelineLCEL(
@@ -141,33 +100,25 @@ def initialize_pipeline() -> Optional[object]:
     except Exception as e:
         logger.error(f"❌ RAG Pipeline initialization failed: {str(e)}")
         return None
-
-def initialize_llm_manager() -> Optional[object]:
-    """Initialize LLM manager."""
+def initialize_llm_manager(model_type: str = MODEL_TYPE, default_model: str = DEFAULT_MODEL) -> Optional[object]:
     if not LLMManager:
-        logger.error("❌ LLM Manager class not available")
         return None
-
     try:
         logger.info("🔄 Initializing LLM Manager...")
         manager = LLMManager(
-            model_type=MODEL_TYPE,
-            default_model=DEFAULT_MODEL,
+            model_type=model_type,
+            default_model=default_model,
             temperature=TEMPERATURE,
             max_tokens=MAX_TOKENS,
         )
-        logger.info(f"✅ LLM Manager initialized (model: {DEFAULT_MODEL})")
+        logger.info(f"✅ LLM Manager initialized")
         return manager
     except Exception as e:
         logger.error(f"❌ LLM Manager initialization failed: {str(e)}")
         return None
-
 def initialize_conversation_manager() -> Optional[object]:
-    """Initialize conversation manager."""
     if not ConversationManager:
-        logger.error("❌ Conversation Manager class not available")
         return None
-
     try:
         logger.info("🔄 Initializing Conversation Manager...")
         manager = ConversationManager(max_history=10, use_memory=True)
@@ -176,205 +127,125 @@ def initialize_conversation_manager() -> Optional[object]:
     except Exception as e:
         logger.error(f"❌ Conversation Manager initialization failed: {str(e)}")
         return None
-
 def initialize_document_loader() -> Optional[object]:
-    """Initialize document loader."""
     if not DocumentLoader:
-        logger.error("❌ Document Loader class not available")
         return None
-
     try:
         logger.info("🔄 Initializing Document Loader...")
-        loader = DocumentLoader(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-        )
+        loader = DocumentLoader(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
         logger.info("✅ Document Loader initialized")
         return loader
     except Exception as e:
         logger.error(f"❌ Document Loader initialization failed: {str(e)}")
         return None
-
 # ============================================================================
 # CHATBOT CLASS
 # ============================================================================
-
 class MultimodalChatbot:
-    """
-    Complete multimodal chatbot with RAG, LLM, and conversation management.
-    
-    Features:
-    - Document ingestion and management
-    - Semantic search with RAG
-    - Multi-turn conversations
-    - Fallback modes
-    """
-
     def __init__(self):
-        """Initialize all components."""
         logger.info("=" * 70)
         logger.info("🤖 MULTIMODAL CHATBOT WITH RAG")
         logger.info("=" * 70)
-
-        # Initialize components
         self.rag_pipeline = initialize_pipeline()
         self.llm_manager = initialize_llm_manager()
         self.conversation_manager = initialize_conversation_manager()
         self.document_loader = initialize_document_loader()
-
-        # Check readiness
-        self.is_ready = bool(self.llm_manager)  # LLM is essential
+        self.current_model_type = MODEL_TYPE
+        self.is_ready = bool(self.llm_manager)
         self.rag_ready = bool(self.rag_pipeline)
-
         if self.is_ready:
             logger.info("✅ Chatbot is ready!")
         else:
             logger.error("❌ Chatbot failed to initialize")
-
-        # Statistics
         self.stats = {
             "messages_processed": 0,
             "documents_added": 0,
             "start_time": datetime.now(),
         }
-
-    def add_documents(
-        self,
-        documents: List[str],
-        metadata: Optional[List[Dict]] = None,
-    ) -> bool:
-        """
-        Add documents to RAG pipeline.
-        
-        Args:
-            documents: List of document texts
-            metadata: Optional metadata for each document
-            
-        Returns:
-            True if successful
-        """
+    def add_documents(self, documents: List[str], metadata: Optional[List[Dict]] = None) -> bool:
         if not self.rag_pipeline:
-            logger.error("❌ RAG Pipeline not available")
             return False
-
         try:
             logger.info(f"📄 Adding {len(documents)} documents...")
             success = self.rag_pipeline.add_documents(documents, metadata)
-
             if success:
-                # Build chain if not already built
                 if self.rag_pipeline.rag_chain is None:
                     self.rag_pipeline.build_rag_chain()
-
                 self.stats["documents_added"] += len(documents)
                 logger.info(f"✅ Added {len(documents)} documents")
                 return True
-            else:
-                logger.error("❌ Failed to add documents")
-                return False
-
+            return False
         except Exception as e:
             logger.error(f"❌ Error adding documents: {str(e)}")
             return False
-
-    def add_file(self, file_path: str) -> bool:
-        """
-        Add documents from file.
-        
-        Args:
-            file_path: Path to file (PDF, TXT, DOCX, Markdown)
-            
-        Returns:
-            True if successful
-        """
-        if not self.document_loader:
-            logger.error("❌ Document Loader not available")
-            return False
-
-        try:
-            logger.info(f"📂 Loading file: {file_path}")
-            docs = self.document_loader.load_file(file_path, with_metadata=True)
-
-            if docs:
-                metadata = [d.metadata for d in docs] if hasattr(docs[0], 'metadata') else None
-                content = [d.page_content if hasattr(d, 'page_content') else str(d) for d in docs]
-                return self.add_documents(content, metadata)
-            else:
-                logger.warning(f"⚠️  No documents extracted from {file_path}")
-                return False
-
-        except Exception as e:
-            logger.error(f"❌ Error loading file: {str(e)}")
-            return False
-
-    def chat(
-        self,
-        user_query: str,
-        use_rag: bool = True,
-        verbose: bool = False,
-    ) -> str:
-        """
-        Process user query and generate response.
-        
-        Args:
-            user_query: User input (STRING only)
-            use_rag: Use RAG context
-            verbose: Print debug info
-            
-        Returns:
-            Chatbot response
-        """
-        # ✅ VERIFY INPUT IS STRING
+    def chat(self, user_query: str, use_rag: bool = True) -> str:
         if not isinstance(user_query, str):
-            logger.error(f"❌ Expected string, got {type(user_query)}")
-            return f"Error: Query must be string, got {type(user_query)}"
-
+            return f"Error: Query must be string"
         if not self.is_ready:
-            return "⚠️  Chatbot not fully initialized. Please check the logs."
-
+            return "⚠️ Chatbot not fully initialized."
         try:
             self.stats["messages_processed"] += 1
-
-            if verbose:
-                logger.info(f"💬 Query: {user_query[:50]}...")
-
-            # Get RAG context if available and requested
-            context = ""
             if use_rag and self.rag_ready and self.rag_pipeline.rag_chain:
-                if verbose:
-                    logger.info("🔍 Searching RAG context...")
                 try:
                     response = self.rag_pipeline.query_with_chain(user_query)
                     if self.conversation_manager:
                         self.conversation_manager.add_message(user_query, response)
                     return response
                 except Exception as e:
-                    logger.warning(f"⚠️  RAG query failed, falling back: {str(e)}")
-
-            # Fallback: use LLM directly with conversation context
-            if verbose:
-                logger.info("🤖 Invoking LLM...")
-
+                    logger.warning(f"⚠️ RAG query failed: {str(e)}")
             response = self.llm_manager.invoke(
                 user_query,
-                context=context,
+                context="",
                 conversation=self.conversation_manager,
             )
-
-            # Add to conversation history
             if self.conversation_manager:
                 self.conversation_manager.add_message(user_query, response)
-
             return response
-
         except Exception as e:
             logger.error(f"❌ Chat error: {str(e)}")
-            import traceback
-            logger.debug(traceback.format_exc())
-            return f"❌ Error generating response: {str(e)}"
-
+            return f"❌ Error: {str(e)}"
+    def switch_model(self, model_id: str, model_type: str) -> Tuple[bool, str]:
+        """✅ KEY FIX: Expects model ID, not display name; reinitializes RAG pipeline for model switch; reinitializes LLMManager if type changes"""
+        if not self.llm_manager:
+            return False, "❌ LLM Manager not available"
+        try:
+            logger.info(f"🔄 Switching model to: {model_id} ({model_type})")
+            if model_type != self.current_model_type:
+                self.llm_manager = initialize_llm_manager(model_type=model_type, default_model=model_id)
+                self.current_model_type = model_type
+                success = bool(self.llm_manager)
+            else:
+                success = self.llm_manager.set_model(model_id)
+           
+            if success:
+                new_model = self.llm_manager.get_current_model_name()
+                if self.rag_pipeline:
+                    use_openai = (model_type == "OpenAI")
+                    self.rag_pipeline = RAGPipelineLCEL(
+                        vectorstore_path=VECTORSTORE_PATH,
+                        chunk_size=CHUNK_SIZE,
+                        chunk_overlap=CHUNK_OVERLAP,
+                        top_k=TOP_K,
+                        embedding_model=EMBEDDING_MODEL,
+                        llm_model=model_id,
+                        use_openai=use_openai,
+                        temperature=TEMPERATURE,
+                        max_tokens=MAX_TOKENS,
+                    )
+                    self.rag_ready = True
+                msg = f"✅ Switched to: {new_model}"
+                logger.info(msg)
+                return True, msg
+            else:
+                msg = f"❌ Failed to switch to: {model_id}"
+                logger.error(msg)
+                return False, msg
+               
+        except Exception as e:
+            msg = f"❌ Error switching model: {str(e)}"
+            logger.error(msg)
+            return False, msg
     def get_status(self) -> Dict:
-        """Get chatbot status."""
         return {
             "is_ready": self.is_ready,
             "rag_ready": self.rag_ready,
@@ -383,23 +254,17 @@ class MultimodalChatbot:
             "documents_added": self.stats["documents_added"],
             "uptime_seconds": (datetime.now() - self.stats["start_time"]).total_seconds(),
         }
-
     def get_rag_stats(self) -> Optional[Dict]:
-        """Get RAG pipeline statistics."""
         if not self.rag_pipeline:
             return None
         return self.rag_pipeline.get_stats()
-
     def reset_conversation(self) -> bool:
-        """Clear conversation history."""
         if self.conversation_manager:
             self.conversation_manager.clear_history()
             logger.info("✅ Conversation history cleared")
             return True
         return False
-
     def save_conversation(self, path: str) -> bool:
-        """Save conversation to JSON."""
         if self.conversation_manager:
             try:
                 self.conversation_manager.export_to_json(path)
@@ -409,291 +274,399 @@ class MultimodalChatbot:
                 logger.error(f"❌ Failed to save conversation: {str(e)}")
                 return False
         return False
-
 # ============================================================================
-# GRADIO INTERFACE
+# GRADIO INTERFACE - BEAUTIFUL
 # ============================================================================
-
 def launch_gradio(chatbot: MultimodalChatbot):
-    """Launch Gradio web interface with proper input field."""
     if not gradio_available:
         logger.error("❌ Gradio not available")
         return
-
-    logger.info(f"🌐 Launching Gradio interface on port {GRADIO_PORT}...")
-
-    # Custom CSS
+    logger.info(f"🌐 Launching on port {GRADIO_PORT}...")
+    # ✅ BEAUTIFUL CSS (adjusted for darker background and full width)
     custom_css = """
-    .chatbot-header { 
-        text-align: center; 
-        color: #4CAF50; 
-        font-size: 24px; 
-        margin: 10px 0;
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    * {
+        font-family: 'Inter', sans-serif;
     }
+    .gradio-container {
+        max-width: none !important;
+        width: 100% !important;
+        background: #121212 !important;
+        border-radius: 0 !important;
+        box-shadow: none !important;
+        color: #e0e0e0 !important;
+    }
+    .header-box {
+        background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
+        padding: 30px;
+        border-radius: 12px;
+        color: white;
+        text-align: center;
+        margin-bottom: 20px;
+    }
+    .header-box h1 {
+        font-size: 2.5em;
+        font-weight: 700;
+        margin: 0;
+        color: white !important;
+    }
+    .header-box p {
+        font-size: 1em;
+        opacity: 0.85;
+        margin: 8px 0 0 0;
+    }
+    h2 {
+        color: #ffffff !important;
+        font-size: 1.4em !important;
+        font-weight: 600 !important;
+        margin: 20px 0 10px 0 !important;
+    }
+    /* Model Switcher */
+    .model-section {
+        background: #1e1e1e;
+        border: 1px solid #333333;
+        border-radius: 12px;
+        padding: 20px;
+        margin: 15px 0;
+    }
+    .model-section:hover {
+        border-color: #5a67d8;
+        box-shadow: 0 4px 12px rgba(90, 103, 216, 0.1);
+    }
+    /* Buttons */
+    button {
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        padding: 10px 20px !important;
+        border: none !important;
+        cursor: pointer !important;
+        transition: all 0.2s ease !important;
+        font-size: 14px !important;
+        background: #333333 !important;
+        color: #e0e0e0 !important;
+    }
+    button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3) !important;
+        background: #444444 !important;
+    }
+    button:active {
+        transform: translateY(0);
+    }
+    /* Primary Button */
+    .gr-button.primary, button[type="submit"],
+    [class*="Button"][class*="primary"] {
+        background: linear-gradient(135deg, #5a67d8 0%, #667eea 100%) !important;
+        color: white !important;
+    }
+    /* Secondary Button */
+    .gr-button.secondary {
+        background: linear-gradient(135deg, #ed64a6 0%, #f56565 100%) !important;
+        color: white !important;
+    }
+    /* Input Fields */
+    input, textarea, select,
+    .gr-textbox, .gr-dropdown {
+        border: 1px solid #333333 !important;
+        border-radius: 8px !important;
+        padding: 10px 14px !important;
+        font-size: 14px !important;
+        transition: all 0.2s ease !important;
+        background: #1e1e1e !important;
+        color: #e0e0e0 !important;
+    }
+    input:focus, textarea:focus, select:focus,
+    .gr-textbox:focus, .gr-dropdown:focus {
+        border-color: #5a67d8 !important;
+        outline: none !important;
+        box-shadow: 0 0 0 2px rgba(90, 103, 216, 0.2) !important;
+    }
+    /* Chatbot */
+    .gr-chatbot {
+        border: 1px solid #333333 !important;
+        border-radius: 12px !important;
+        background: #1e1e1e !important;
+        color: #e0e0e0 !important;
+    }
+    .message {
+        border-radius: 10px !important;
+        background: #252525 !important;
+        color: #e0e0e0 !important;
+    }
+    .message.user {
+        background: #2c3e50 !important;
+    }
+    /* Status Box */
     .status-box {
-        padding: 10px;
-        border-radius: 5px;
-        background-color: #f0f0f0;
+        background: #1e1e1e;
+        border: 1px solid #333333;
+        border-radius: 10px;
+        padding: 14px;
         margin: 10px 0;
+        color: #e0e0e0 !important;
+    }
+    /* Group */
+    .group {
+        background: #1e1e1e !important;
+        border: 1px solid #333333 !important;
+        border-radius: 12px !important;
+        padding: 20px !important;
+    }
+    /* Radio */
+    input[type="radio"] {
+        cursor: pointer;
+        margin-right: 6px;
+    }
+    label {
+        cursor: pointer;
+        font-weight: 500;
+        color: #e0e0e0 !important;
     }
     """
-
     def status_fn() -> str:
-        """Get status."""
         status = chatbot.get_status()
         uptime = status["uptime_seconds"]
         uptime_str = f"{int(uptime // 60)}m {int(uptime % 60)}s"
-        
+       
+        status_icon = "✅" if status['is_ready'] else "❌"
+        rag_icon = "✅" if status['rag_ready'] else "⚠️"
+       
         return f"""
-        **Status:** {'✅ Ready' if status['is_ready'] else '❌ Not Ready'}
-        
-        **Model:** {status['model']}
-        
-        **Messages:** {status['messages_processed']}
-        
-        **Documents:** {status['documents_added']}
-        
-        **RAG:** {'✅ Active' if status['rag_ready'] else '⚠️ Inactive'}
-        
-        **Uptime:** {uptime_str}
+        **{status_icon} Status:** {'Ready' if status['is_ready'] else 'Not Ready'}
+       
+        **🤖 Model:** {status['model']}
+       
+        **💬 Messages:** {status['messages_processed']}
+       
+        **📄 Documents:** {status['documents_added']}
+       
+        **{rag_icon} RAG:** {'Active' if status['rag_ready'] else 'Inactive'}
+       
+        **⏱️ Uptime:** {uptime_str}
         """
-
     def rag_stats_fn() -> str:
-        """Get RAG statistics."""
         stats = chatbot.get_rag_stats()
         if not stats:
-            return "⚠️ RAG Pipeline not available"
+            return "⚠️ RAG not available"
+       
+        status = stats.get('status', 'N/A')
+        status_icon = "✅" if status == 'active' else "⚠️"
+       
         return f"""
-        **Status:** {stats.get('status', 'N/A')}
-        
-        **Documents:** {stats.get('num_documents', 0)}
-        
-        **Model:** {stats.get('embedding_model', 'N/A')}
-        
-        **Device:** {stats.get('device', 'N/A')}
+        **{status_icon} Status:** {status}
+       
+        **📚 Documents:** {stats.get('num_documents', 0)}
+       
+        **🧠 Embedding:** {stats.get('embedding_model', 'N/A').split('/')[-1]}
+       
+        **💻 Device:** {stats.get('device', 'N/A')}
         """
-
-    # ✅ KEY FIX: Proper message handling with input field
     def handle_user_input(message: str, chat_history):
-        """
-        Handle user input and generate response.
-        
-        Args:
-            message: User input string from textbox
-            chat_history: Current chat history as List[List[str, str]]
-            
-        Returns:
-            Updated chat history and empty input field
-        """
         if not message or not message.strip():
             return chat_history, ""
-
         try:
             user_input = message.strip()
-            logger.info(f"💬 User: {user_input[:50]}...")
-            
-            # ✅ Call chatbot with STRING only
             response = chatbot.chat(user_input, use_rag=True)
-            
-            logger.info(f"✅ Assistant: {response[:50]}...")
-            
-            # ✅ Append to chat history
+           
             if chat_history is None:
                 chat_history = []
             chat_history.append([user_input, response])
-            
-            # Return updated history and clear input
+           
             return chat_history, ""
-
         except Exception as e:
             logger.error(f"❌ Error: {str(e)}")
-            import traceback
-            logger.debug(traceback.format_exc())
-            
             if chat_history is None:
                 chat_history = []
             chat_history.append([message, f"❌ Error: {str(e)}"])
             return chat_history, ""
-
-    # Create interface
-    with gr.Blocks(css=custom_css, title="🤖 Multimodal Chatbot RAG") as demo:
-        
+    # ✅ KEY FIX: Pass model ID, not display name
+    def switch_model_fn(model_type, selected_model):
+        """Switch model - model_id passed directly"""
+        try:
+            if model_type == "OpenAI":
+                logger.info(f"[Model] OpenAI selected: {selected_model}")
+            else:
+                logger.info(f"[Model] Local selected: {selected_model}")
+           
+            # ✅ Direct model ID - no conversion needed
+            success, message = chatbot.switch_model(selected_model, model_type)
+            return message
+           
+        except Exception as e:
+            error_msg = f"❌ Error: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
+    # ============================================================================
+    # CREATE INTERFACE
+    # ============================================================================
+    with gr.Blocks(css=custom_css, title="🤖 AI Chatbot with RAG", theme=gr.themes.Soft()) as demo:
+       
         # Header
-        gr.Markdown("# 🤖 Multimodal Chatbot with RAG")
-        gr.Markdown(
-            "Ask questions and get intelligent answers powered by "
-            "**Retrieval-Augmented Generation** and large language models."
-        )
-
-        # Main chat section
+        gr.HTML("""
+        <div class="header-box">
+            <h1>🤖 AI Chatbot with RAG</h1>
+            <p>Powered by Retrieval-Augmented Generation & Advanced LLMs</p>
+        </div>
+        """)
+        # ============================================================================
+        # MODEL SWITCHER
+        # ============================================================================
+        with gr.Group(elem_classes="model-section"):
+            gr.Markdown("## 🎛️ Model Selection")
+           
+            with gr.Row():
+                model_type = gr.Radio(
+                    choices=["OpenAI", "Local"],
+                    value="OpenAI",
+                    label="📌 Model Type",
+                    scale=1
+                )
+               
+                # ✅ KEY FIX: Store model IDs in value
+                openai_model = gr.Dropdown(
+                    choices=[display for model_id, display in OPENAI_MODELS],
+                    value=OPENAI_MODELS[0][1],
+                    label="🔗 OpenAI Model",
+                    scale=2,
+                    visible=True
+                )
+               
+                local_model = gr.Dropdown(
+                    choices=[display for model_id, display in LOCAL_MODELS],
+                    value=LOCAL_MODELS[0][1],
+                    label="🔗 Local Model",
+                    scale=2,
+                    visible=False
+                )
+               
+                apply_btn = gr.Button("🔄 Switch", variant="primary", scale=1)
+           
+            switch_status = gr.Textbox(
+                label="Status",
+                interactive=False,
+                value="✅ Ready to switch",
+                lines=1
+            )
+        # ============================================================================
+        # MAIN CHAT
+        # ============================================================================
         with gr.Row():
             with gr.Column(scale=2):
                 gr.Markdown("## 💬 Chat")
-                
-                # ✅ Chat display (read-only history)
+               
                 chat_display = gr.Chatbot(
                     label="Conversation",
-                    height=500,
-                    scale=1
+                    height=600,
+                    show_copy_button=True
                 )
-                
-                # ✅ User input area - THIS IS KEY!
+               
                 with gr.Row():
                     message_input = gr.Textbox(
-                        label="Your Message",
-                        placeholder="Type your question here and press Enter or click Send...",
+                        label="Message",
+                        placeholder="Type here...",
                         lines=2,
-                        scale=4,
-                        max_lines=10
+                        scale=4
                     )
-                    submit_btn = gr.Button(
-                        "Send",
-                        variant="primary",
-                        scale=1
-                    )
-
+                    submit_btn = gr.Button("📤 Send", variant="primary", scale=1)
+            # ============================================================================
+            # SIDEBAR
+            # ============================================================================
             with gr.Column(scale=1):
                 gr.Markdown("## 📊 Status")
                 status_output = gr.Markdown()
-                refresh_status_btn = gr.Button("🔄 Refresh Status", size="sm")
-
+                refresh_status_btn = gr.Button("🔄 Refresh", scale=1)
+                gr.Markdown("---")
                 gr.Markdown("## 📈 RAG Stats")
                 rag_stats_output = gr.Markdown()
-                refresh_rag_btn = gr.Button("🔄 Refresh RAG Stats", size="sm")
-
+                refresh_rag_btn = gr.Button("🔄 Refresh", scale=1)
+                gr.Markdown("---")
                 gr.Markdown("## 🎯 Actions")
-                reset_btn = gr.Button("🗑️ Clear History", variant="secondary", size="sm")
-                save_btn = gr.Button("💾 Save Conversation", size="sm")
-
-        # ✅ PROPER EVENT HANDLING
-        
-        # Submit button click
+                reset_btn = gr.Button("🗑️ Clear", scale=1)
+                save_btn = gr.Button("💾 Save", scale=1)
+        # ============================================================================
+        # EVENTS
+        # ============================================================================
         submit_btn.click(
             handle_user_input,
             inputs=[message_input, chat_display],
             outputs=[chat_display, message_input],
             queue=True
         )
-
-        # Enter key in textbox
         message_input.submit(
             handle_user_input,
             inputs=[message_input, chat_display],
             outputs=[chat_display, message_input],
             queue=True
         )
-
-        # Status refresh
-        refresh_status_btn.click(
-            status_fn,
-            outputs=status_output,
+        # Model type toggle
+        def update_visibility(model_type_value):
+            if model_type_value == "OpenAI":
+                return gr.update(visible=True), gr.update(visible=False)
+            else:
+                return gr.update(visible=False), gr.update(visible=True)
+       
+        model_type.change(
+            update_visibility,
+            inputs=model_type,
+            outputs=[openai_model, local_model]
+        )
+        # ✅ KEY FIX: Pass model_id directly from dropdown value
+        def switch_with_id(model_type, openai_display, local_display):
+            # Get model ID from display text
+            if model_type == "OpenAI":
+                model_id = next(mid for mid, display in OPENAI_MODELS if display == openai_display)
+            else:
+                model_id = next(mid for mid, display in LOCAL_MODELS if display == local_display)
+           
+            return switch_model_fn(model_type, model_id)
+        apply_btn.click(
+            switch_with_id,
+            inputs=[model_type, openai_model, local_model],
+            outputs=switch_status,
             queue=False
         )
-        
-        # RAG stats refresh
-        refresh_rag_btn.click(
-            rag_stats_fn,
-            outputs=rag_stats_output,
-            queue=False
-        )
-        
-        # Clear history
+        refresh_status_btn.click(status_fn, outputs=status_output, queue=False)
+        refresh_rag_btn.click(rag_stats_fn, outputs=rag_stats_output, queue=False)
+       
         def clear_history_fn():
             chatbot.reset_conversation()
             return [], ""
-        
-        reset_btn.click(
-            clear_history_fn,
-            outputs=[chat_display, message_input],
-            queue=False
-        )
-        
-        # Save conversation
+       
+        reset_btn.click(clear_history_fn, outputs=[chat_display, message_input], queue=False)
+       
         def save_conv_fn():
             success = chatbot.save_conversation("conversation.json")
-            return "✅ Conversation saved!" if success else "❌ Failed to save"
-        
-        save_btn.click(
-            save_conv_fn,
-            queue=False
-        )
-
-    # Launch
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=GRADIO_PORT,
-        share=False,
-        show_error=True,
-    )
-
+            return "✅ Saved!" if success else "❌ Failed"
+       
+        save_btn.click(save_conv_fn, queue=False)
+    demo.launch(server_name="0.0.0.0", server_port=GRADIO_PORT, share=False, show_error=True)
 # ============================================================================
-# MAIN FUNCTION
+# MAIN
 # ============================================================================
-
 def main():
-    """Main entry point."""
     try:
-        logger.info("🚀 Starting Multimodal Chatbot...")
-
-        # Initialize chatbot
+        logger.info("🚀 Starting Chatbot...")
         chatbot = MultimodalChatbot()
-
-        # Add sample documents if RAG is available
         if chatbot.rag_ready:
             logger.info("📚 Adding sample documents...")
             sample_docs = [
-                "Machine learning is a subset of artificial intelligence that enables systems to learn from data without being explicitly programmed.",
-                "Deep learning uses neural networks with multiple layers (hence 'deep') to process complex patterns in data.",
-                "Retrieval-Augmented Generation (RAG) combines information retrieval with generation to produce more accurate and contextual responses.",
-                "LangChain is a framework for developing applications powered by language models, enabling composition and chaining of LLM interactions.",
-                "Natural language processing (NLP) focuses on enabling computers to understand and process human language in a meaningful way.",
+                "Machine learning is a subset of AI that learns from data.",
+                "Deep learning uses neural networks with multiple layers.",
+                "RAG combines retrieval with generation for better responses.",
+                "LangChain is a framework for LLM applications.",
+                "NLP focuses on understanding human language.",
             ]
             chatbot.add_documents(sample_docs)
-
-        # Display status
         status = chatbot.get_status()
-        logger.info(
-            f"\n{'=' * 70}\n"
-            f"Chatbot Status:\n"
-            f"  Ready: {status['is_ready']}\n"
-            f"  Model: {status['model']}\n"
-            f"  RAG: {status['rag_ready']}\n"
-            f"{'=' * 70}\n"
-        )
-
-        # Launch Gradio if available, otherwise provide CLI
+        logger.info(f"\n{'=' * 70}\nChatbot Ready!\nModel: {status['model']}\nRAG: {status['rag_ready']}\n{'=' * 70}\n")
         if gradio_available:
             launch_gradio(chatbot)
         else:
-            logger.warning("⚠️  Gradio not available. Running in CLI mode...")
-            logger.info("Install Gradio with: pip install gradio")
-
-            # Simple CLI interface
-            while True:
-                try:
-                    user_input = input("\n🤖 You: ").strip()
-                    if user_input.lower() in ["exit", "quit", "bye"]:
-                        logger.info("👋 Goodbye!")
-                        break
-                    if not user_input:
-                        continue
-
-                    response = chatbot.chat(user_input)
-                    print(f"\n💬 Chatbot: {response}")
-
-                except KeyboardInterrupt:
-                    logger.info("👋 Interrupted by user")
-                    break
-
+            logger.warning("⚠️ Gradio not available")
     except Exception as e:
         logger.critical(f"❌ Fatal error: {str(e)}")
         import traceback
         logger.critical(traceback.format_exc())
         sys.exit(1)
-
-# ============================================================================
-# EXECUTION GUARD
-# ============================================================================
-
 if __name__ == "__main__":
     main()

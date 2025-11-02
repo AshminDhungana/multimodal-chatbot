@@ -25,7 +25,7 @@ from typing import List, Dict, Optional, Any
 from datetime import datetime
 
 # ============================================================================
-# LANGCHAIN 1.0.3 IMPORTS (CORRECT - NO StrOutputParser)
+# LANGCHAIN 1.0.3 IMPORTS 
 # ============================================================================
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -502,5 +502,5 @@ def prepare_context_from_documents(
     return "\n\n---\n\n".join(parts)
 
 # ============================================================================
-# END OF MODULE -
+# END OF MODULE 
 # ============================================================================
