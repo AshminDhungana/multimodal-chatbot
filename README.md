@@ -92,6 +92,9 @@ multimodel-chatbot/
 │   ├── test_models.py        # Model integration tests
 │   └── test_embeddings.py    # Embedding tests
 ├── docs/
+│   ├── QUICKSTART.md
+│   ├── SETUP_GUIDE.md
+│   
 ├── requirements.txt          #  dependencies
 ├── .env                     # Environment template
 ├── .gitignore
