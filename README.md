@@ -39,6 +39,9 @@ source venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
+#If error use this instead
+pip install -r requirements.txt --only-binary :all: --no-build-isolation
+
 # Set up environment variables
 cp .env.example .env
 # Edit .env and add your configuration
@@ -70,6 +73,14 @@ TOP_K=5                           # Number of retrieved documents
 ```bash
 # Start the application
 python app.py
+```
+
+```
+# If any error with NLTK
+python 
+>> import nltk
+>> nltk.download('wordnet')
+>> nltk.download('omw-1.4')
 ```
 
 Then open your browser and navigate to `http://localhost:7860`

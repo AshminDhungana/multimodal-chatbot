@@ -1,28 +1,41 @@
 """
-Document Loader Module for Multimodel Chatbot
+Document Loader Module for Multimodal Chatbot (RAG System)
+===========================================================
 
-This module handles document processing and preparation for the RAG system.
-It provides:
-- Loading documents from various file formats (PDF, TXT, DOCX)
-- Text extraction and cleaning
-- Document chunking into smaller pieces
-- Metadata extraction and attachment
-- Support for batch processing
+This module prepares raw files into vector-friendly chunks for Retrieval-Augmented Generation (RAG).
 
-The document loader prepares raw files into properly formatted chunks
-that can be stored in the vector database.
+Features:
+- Supports PDF, TXT, Markdown, and DOCX
+- Extracts and cleans text
+- Splits into overlapping chunks
+- Attaches metadata (file type, size, page count)
+- Handles batch and directory processing
+- LangChain 1.0.3 compatible
 """
 
 import os
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from pathlib import Path
 from abc import ABC, abstractmethod
 
-# Third-party imports
-import PyPDF2
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
+# ============================================================================
+# LANGCHAIN 1.0.3 IMPORTS (COMPATIBLE)
+# ============================================================================
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+
+# Optional imports
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+
+try:
+    from docx import Document as DocxDocument
+except ImportError:
+    DocxDocument = None
 
 # ============================================================================
 # CONFIGURATION
@@ -30,38 +43,36 @@ from langchain.schema import Document
 
 logger = logging.getLogger(__name__)
 
-# Supported file extensions
-SUPPORTED_FORMATS = {
-    '.pdf': 'PDF Document',
-    '.txt': 'Text File',
-    '.md': 'Markdown File',
-    '.docx': 'Word Document',
+SUPPORTED_FORMATS: Dict[str, str] = {
+    ".pdf": "PDF Document",
+    ".txt": "Text File",
+    ".md": "Markdown File",
+    ".docx": "Word Document",
 }
 
-# Maximum file size (100 MB)
-MAX_FILE_SIZE = 100 * 1024 * 1024
-
+MAX_FILE_SIZE: int = 100 * 1024 * 1024  # 100 MB
 
 # ============================================================================
-# BASE FILE LOADER CLASS
+# BASE FILE LOADER
 # ============================================================================
 
 class BaseFileLoader(ABC):
-    """
-    Abstract base class for file loaders.
-    
-    Defines the interface that all file type loaders must implement.
-    """
-    
-    @abstractmethod
-    def load(self, file_path: str) -> str:
-        """Load and extract text from file."""
-        pass
-    
+    """Abstract base class for file loaders."""
+
     @abstractmethod
     def supports_format(self, file_path: str) -> bool:
         """Check if loader supports this file format."""
-        pass
+        raise NotImplementedError
+
+    @abstractmethod
+    def load(self, file_path: str) -> str:
+        """Load and extract text from a file."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_with_metadata(self, file_path: str) -> Tuple[str, Dict[str, Any]]:
+        """Load text and return with metadata."""
+        raise NotImplementedError
 
 
 # ============================================================================
@@ -69,610 +80,429 @@ class BaseFileLoader(ABC):
 # ============================================================================
 
 class PDFLoader(BaseFileLoader):
-    """
-    Loader for PDF documents.
-    
-    Extracts text from PDF files, handling multi-page documents.
-    
-    Attributes:
-        file_path: Path to PDF file
-    """
-    
+    """Extracts text from PDF documents using PyPDF2."""
+
+    def __init__(self):
+        if PyPDF2 is None:
+            raise ImportError("PyPDF2 not installed. Install with: pip install PyPDF2")
+
     def supports_format(self, file_path: str) -> bool:
         """Check if file is PDF."""
-        return file_path.lower().endswith('.pdf')
-    
+        return file_path.lower().endswith(".pdf")
+
     def load(self, file_path: str) -> str:
-        """
-        Extract text from PDF file.
-        
-        Args:
-            file_path: Path to PDF file
-            
-        Returns:
-            Extracted text from all pages
-            
-        Raises:
-            FileNotFoundError: If file doesn't exist
-            ValueError: If PDF is corrupted or unreadable
-            
-        Example:
-            >>> loader = PDFLoader()
-            >>> text = loader.load("document.pdf")
-            >>> print(text[:100])
-        """
+        """Extract text from PDF file."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"PDF file not found: {file_path}")
+
+        size = os.path.getsize(file_path)
+        if size > MAX_FILE_SIZE:
+            raise ValueError(
+                f"File too large: {size / 1024 / 1024:.2f} MB (max: {MAX_FILE_SIZE / 1024 / 1024:.0f} MB)"
+            )
+
+        logger.info(f"Loading PDF: {os.path.basename(file_path)} ({size / 1024:.2f} KB)")
+        text_pages = []
+
         try:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"PDF file not found: {file_path}")
-            
-            logger.info(f"Loading PDF: {file_path}")
-            
-            file_size = os.path.getsize(file_path)
-            if file_size > MAX_FILE_SIZE:
-                raise ValueError(f"File too large: {file_size / 1024 / 1024:.1f} MB")
-            
-            # Open and read PDF
-            text_content = []
-            page_count = 0
-            
-            with open(file_path, 'rb') as pdf_file:
-                pdf_reader = PyPDF2.PdfReader(pdf_file)
-                page_count = len(pdf_reader.pages)
-                
-                logger.info(f"PDF has {page_count} pages")
-                
-                for page_num, page in enumerate(pdf_reader.pages, 1):
+            with open(file_path, "rb") as f:
+                pdf = PyPDF2.PdfReader(f)
+                total_pages = len(pdf.pages)
+
+                for i, page in enumerate(pdf.pages, start=1):
                     try:
-                        page_text = page.extract_text()
-                        if page_text:
-                            text_content.append(page_text)
+                        page_text = page.extract_text() or ""
+                        if page_text.strip():
+                            text_pages.append(page_text)
                     except Exception as e:
-                        logger.warning(f"Failed to extract page {page_num}: {str(e)}")
+                        logger.warning(f"Failed to extract page {i}/{total_pages}: {str(e)}")
                         continue
-            
-            full_text = "\n\n".join(text_content)
-            
-            logger.info(f"Successfully extracted {len(full_text)} characters from {page_count} pages")
-            return full_text
-            
+
+            if not text_pages:
+                logger.warning(f"No text extracted from PDF: {file_path}")
+                return ""
+
+            combined_text = "\n\n".join(text_pages).strip()
+            logger.info(
+                f"✅ PDF extracted: {len(combined_text)} chars from {len(pdf.pages)} pages"
+            )
+            return combined_text
+
         except Exception as e:
-            logger.error(f"Error loading PDF: {str(e)}")
+            logger.error(f"Failed to read PDF {file_path}: {str(e)}")
             raise
-    
-    def load_with_metadata(self, file_path: str) -> Tuple[str, Dict]:
-        """
-        Load PDF with metadata.
-        
-        Returns:
-            Tuple of (text, metadata)
-        """
+
+    def load_with_metadata(self, file_path: str) -> Tuple[str, Dict[str, Any]]:
+        """Load PDF with metadata."""
         text = self.load(file_path)
+        
+        with open(file_path, "rb") as f:
+            pdf = PyPDF2.PdfReader(f)
+            page_count = len(pdf.pages)
+
         metadata = {
-            'source': os.path.basename(file_path),
-            'file_type': 'PDF',
-            'file_size': os.path.getsize(file_path),
-            'pages': len(text.split('\n\n'))  # Approximate
+            "source": os.path.basename(file_path),
+            "file_type": "PDF",
+            "file_size_bytes": os.path.getsize(file_path),
+            "pages": page_count,
+            "characters": len(text),
         }
         return text, metadata
 
 
 # ============================================================================
-# TEXT LOADER
+# TEXT / MARKDOWN LOADER
 # ============================================================================
 
 class TextLoader(BaseFileLoader):
-    """
-    Loader for plain text files (.txt, .md).
-    
-    Reads and processes text-based files.
-    
-    Attributes:
-        encoding: Text file encoding (default: utf-8)
-    """
-    
-    def __init__(self, encoding: str = 'utf-8'):
-        """
-        Initialize Text Loader.
-        
-        Args:
-            encoding: File encoding to use
-        """
+    """Loads text (.txt) or markdown (.md) files."""
+
+    def __init__(self, encoding: str = "utf-8"):
         self.encoding = encoding
-    
+        self.fallback_encodings = ["latin-1", "iso-8859-1", "cp1252"]
+
     def supports_format(self, file_path: str) -> bool:
-        """Check if file is text-based."""
-        return file_path.lower().endswith(('.txt', '.md'))
-    
+        """Check if file is .txt or .md."""
+        ext = file_path.lower()
+        return ext.endswith((".txt", ".md"))
+
     def load(self, file_path: str) -> str:
-        """
-        Load text from file.
-        
-        Args:
-            file_path: Path to text file
-            
-        Returns:
-            File contents as string
-            
-        Example:
-            >>> loader = TextLoader()
-            >>> text = loader.load("document.txt")
-        """
+        """Load text from file with fallback encoding."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Text file not found: {file_path}")
+
+        size = os.path.getsize(file_path)
+        if size > MAX_FILE_SIZE:
+            raise ValueError(
+                f"File too large: {size / 1024 / 1024:.2f} MB (max: {MAX_FILE_SIZE / 1024 / 1024:.0f} MB)"
+            )
+
+        file_type = Path(file_path).suffix.upper()
+        logger.info(f"Loading {file_type}: {os.path.basename(file_path)} ({size / 1024:.2f} KB)")
+
+        # Try primary encoding
         try:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"Text file not found: {file_path}")
-            
-            logger.info(f"Loading text file: {file_path}")
-            
-            file_size = os.path.getsize(file_path)
-            if file_size > MAX_FILE_SIZE:
-                raise ValueError(f"File too large: {file_size / 1024 / 1024:.1f} MB")
-            
-            # Read file with specified encoding
-            with open(file_path, 'r', encoding=self.encoding) as file:
-                text = file.read()
-            
-            logger.info(f"Successfully loaded {len(text)} characters")
-            return text
-            
-        except UnicodeDecodeError:
-            logger.warning(f"UTF-8 decode failed, trying latin-1")
-            with open(file_path, 'r', encoding='latin-1') as file:
-                text = file.read()
-            return text
-            
-        except Exception as e:
-            logger.error(f"Error loading text file: {str(e)}")
-            raise
-    
-    def load_with_metadata(self, file_path: str) -> Tuple[str, Dict]:
+            with open(file_path, "r", encoding=self.encoding) as f:
+                text = f.read()
+            logger.info(f"✅ Loaded with {self.encoding} encoding")
+            return text.strip()
+
+        except UnicodeDecodeError as e:
+            logger.warning(
+                f"Failed to decode with {self.encoding}, trying fallback encodings"
+            )
+
+            # Try fallback encodings
+            for encoding in self.fallback_encodings:
+                try:
+                    with open(file_path, "r", encoding=encoding) as f:
+                        text = f.read()
+                    logger.info(f"✅ Loaded with {encoding} encoding")
+                    return text.strip()
+                except UnicodeDecodeError:
+                    continue
+
+            # If all fails, raise original error
+            raise ValueError(
+                f"Could not decode {file_path} with any supported encoding. "
+                f"Tried: {[self.encoding] + self.fallback_encodings}"
+            )
+
+    def load_with_metadata(self, file_path: str) -> Tuple[str, Dict[str, Any]]:
         """Load text file with metadata."""
         text = self.load(file_path)
+        
         metadata = {
-            'source': os.path.basename(file_path),
-            'file_type': 'Text',
-            'file_size': os.path.getsize(file_path),
-            'lines': len(text.split('\n'))
+            "source": os.path.basename(file_path),
+            "file_type": "Text" if file_path.endswith(".txt") else "Markdown",
+            "file_size_bytes": os.path.getsize(file_path),
+            "lines": len(text.splitlines()),
+            "characters": len(text),
         }
         return text, metadata
 
 
 # ============================================================================
-# WORD DOCUMENT LOADER
+# DOCX LOADER
 # ============================================================================
 
 class DocxLoader(BaseFileLoader):
-    """
-    Loader for Word documents (.docx).
-    
-    Extracts text from DOCX files.
-    """
-    
+    """Extracts text from Word (.docx) documents."""
+
+    def __init__(self):
+        if DocxDocument is None:
+            raise ImportError(
+                "python-docx not installed. Install with: pip install python-docx"
+            )
+
     def supports_format(self, file_path: str) -> bool:
-        """Check if file is DOCX."""
-        return file_path.lower().endswith('.docx')
-    
+        """Check if file is .docx."""
+        return file_path.lower().endswith(".docx")
+
     def load(self, file_path: str) -> str:
-        """
-        Extract text from DOCX file.
-        
-        Args:
-            file_path: Path to DOCX file
-            
-        Returns:
-            Extracted text
-            
-        Example:
-            >>> loader = DocxLoader()
-            >>> text = loader.load("document.docx")
-        """
+        """Extract text from DOCX file."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"DOCX file not found: {file_path}")
+
+        size = os.path.getsize(file_path)
+        if size > MAX_FILE_SIZE:
+            raise ValueError(
+                f"File too large: {size / 1024 / 1024:.2f} MB (max: {MAX_FILE_SIZE / 1024 / 1024:.0f} MB)"
+            )
+
+        logger.info(f"Loading DOCX: {os.path.basename(file_path)} ({size / 1024:.2f} KB)")
+
         try:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"DOCX file not found: {file_path}")
-            
-            logger.info(f"Loading DOCX: {file_path}")
-            
-            # Try to import python-docx
-            try:
-                from docx import Document as DocxDocument
-            except ImportError:
-                logger.error("python-docx not installed. Install with: pip install python-docx")
-                raise
-            
-            # Load DOCX
             doc = DocxDocument(file_path)
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
             
-            # Extract text from all paragraphs
-            paragraphs = []
-            for para in doc.paragraphs:
-                if para.text.strip():
-                    paragraphs.append(para.text)
-            
-            full_text = "\n".join(paragraphs)
-            
-            logger.info(f"Successfully extracted {len(full_text)} characters from {len(doc.paragraphs)} paragraphs")
-            return full_text
-            
+            if not paragraphs:
+                logger.warning(f"No text found in DOCX: {file_path}")
+                return ""
+
+            text = "\n".join(paragraphs).strip()
+            logger.info(f"✅ DOCX extracted: {len(text)} chars from {len(paragraphs)} paragraphs")
+            return text
+
         except Exception as e:
-            logger.error(f"Error loading DOCX: {str(e)}")
+            logger.error(f"Failed to read DOCX {file_path}: {str(e)}")
             raise
-    
-    def load_with_metadata(self, file_path: str) -> Tuple[str, Dict]:
+
+    def load_with_metadata(self, file_path: str) -> Tuple[str, Dict[str, Any]]:
         """Load DOCX with metadata."""
         text = self.load(file_path)
+        doc = DocxDocument(file_path)
+
         metadata = {
-            'source': os.path.basename(file_path),
-            'file_type': 'DOCX',
-            'file_size': os.path.getsize(file_path),
+            "source": os.path.basename(file_path),
+            "file_type": "DOCX",
+            "file_size_bytes": os.path.getsize(file_path),
+            "paragraphs": len(doc.paragraphs),
+            "characters": len(text),
         }
         return text, metadata
 
 
 # ============================================================================
-# DOCUMENT LOADER CLASS (MAIN)
+# MAIN DOCUMENT LOADER
 # ============================================================================
 
 class DocumentLoader:
     """
-    Main document loader that handles multiple file formats.
+    Main entry point for loading and chunking multiple file formats.
     
-    This class:
-    1. Detects file type
-    2. Uses appropriate loader
-    3. Extracts and cleans text
-    4. Splits into chunks
-    5. Attaches metadata
+    Supports: PDF, TXT, Markdown (.md), and DOCX
     
-    Attributes:
-        chunk_size: Size of text chunks
-        chunk_overlap: Overlap between chunks
-        loaders: Dictionary of file type loaders
-        text_splitter: RecursiveCharacterTextSplitter instance
+    Example:
+        loader = DocumentLoader(chunk_size=500, chunk_overlap=100)
+        documents = loader.load_file("document.pdf", with_metadata=True)
     """
-    
+
     def __init__(
         self,
         chunk_size: int = 500,
         chunk_overlap: int = 100,
-        encoding: str = 'utf-8'
+        encoding: str = "utf-8",
     ):
-        """
-        Initialize Document Loader.
-        
-        Args:
-            chunk_size: Characters per chunk
-            chunk_overlap: Character overlap between chunks
-            encoding: Text file encoding
-        """
+        """Initialize DocumentLoader with chunking configuration."""
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.encoding = encoding
-        
-        # Initialize file loaders
-        self.loaders = {
-            '.pdf': PDFLoader(),
-            '.txt': TextLoader(encoding),
-            '.md': TextLoader(encoding),
-            '.docx': DocxLoader(),
-        }
-        
+
+        # Initialize loaders (with lazy imports)
+        self.loaders = {}
+        try:
+            self.loaders[".pdf"] = PDFLoader()
+        except ImportError:
+            logger.warning("PyPDF2 not installed, PDF loading disabled")
+
+        self.loaders[".txt"] = TextLoader(encoding)
+        self.loaders[".md"] = TextLoader(encoding)
+
+        try:
+            self.loaders[".docx"] = DocxLoader()
+        except ImportError:
+            logger.warning("python-docx not installed, DOCX loading disabled")
+
         # Initialize text splitter
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            separators=["\n\n", "\n", ". ", " ", ""]
+            separators=["\n\n", "\n", ". ", " ", ""],
         )
-        
-        logger.info(f"DocumentLoader initialized (chunk_size={chunk_size}, overlap={chunk_overlap})")
-    
+
+        logger.info(
+            f"DocumentLoader initialized: chunk_size={chunk_size}, overlap={chunk_overlap}"
+        )
+
     # ========================================================================
-    # FILE LOADING
+    # CORE METHODS
     # ========================================================================
-    
+
     def load_file(
-        self,
-        file_path: str,
-        return_metadata: bool = False
-    ) -> List[str]:
+        self, 
+        file_path: str, 
+        with_metadata: bool = False,
+    ) -> List[Any]:
         """
         Load and chunk a single file.
         
         Args:
-            file_path: Path to document file
-            return_metadata: If True, return tuples of (chunk, metadata)
-            
-        Returns:
-            List of text chunks (or tuples if return_metadata=True)
-            
-        Example:
-            >>> loader = DocumentLoader()
-            >>> chunks = loader.load_file("document.pdf")
-            >>> print(f"Got {len(chunks)} chunks")
-            >>> print(chunks[0][:100])
-        """
-        try:
-            logger.info(f"Loading file: {file_path}")
-            
-            # Check file exists
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"File not found: {file_path}")
-            
-            # Get file extension
-            file_ext = os.path.splitext(file_path)[1].lower()
-            
-            # Check if supported
-            if file_ext not in self.loaders:
-                supported = ", ".join(self.loaders.keys())
-                raise ValueError(f"Unsupported file type: {file_ext}. Supported: {supported}")
-            
-            # Load file with appropriate loader
-            loader = self.loaders[file_ext]
-            text = loader.load(file_path)
-            
-            if not text or not text.strip():
-                logger.warning("Extracted text is empty")
-                return []
-            
-            # Clean text
-            text = self._clean_text(text)
-            
-            # Split into chunks
-            chunks = self.text_splitter.split_text(text)
-            
-            logger.info(f"Split into {len(chunks)} chunks")
-            
-            if return_metadata:
-                _, metadata = loader.load_with_metadata(file_path)
-                return [(chunk, metadata) for chunk in chunks]
-            
-            return chunks
-            
-        except Exception as e:
-            logger.error(f"Error loading file: {str(e)}")
-            raise
-    
-    def load_directory(
-        self,
-        directory_path: str,
-        recursive: bool = True
-    ) -> List[str]:
-        """
-        Load and chunk all documents in a directory.
-        
-        Args:
-            directory_path: Path to directory
-            recursive: Whether to search subdirectories
-            
-        Returns:
-            List of all chunks from all files
-            
-        Example:
-            >>> loader = DocumentLoader()
-            >>> chunks = loader.load_directory("./documents/")
-            >>> print(f"Got {len(chunks)} chunks from multiple files")
-        """
-        try:
-            logger.info(f"Loading directory: {directory_path}")
-            
-            if not os.path.isdir(directory_path):
-                raise ValueError(f"Not a directory: {directory_path}")
-            
-            all_chunks = []
-            
-            # Get file pattern
-            if recursive:
-                files = Path(directory_path).rglob('*')
-            else:
-                files = Path(directory_path).glob('*')
-            
-            # Process each file
-            file_count = 0
-            for file_path in files:
-                if file_path.is_file():
-                    file_ext = file_path.suffix.lower()
-                    if file_ext in self.loaders:
-                        try:
-                            chunks = self.load_file(str(file_path))
-                            all_chunks.extend(chunks)
-                            file_count += 1
-                        except Exception as e:
-                            logger.warning(f"Failed to load {file_path}: {str(e)}")
-            
-            logger.info(f"Loaded {file_count} files, total {len(all_chunks)} chunks")
-            return all_chunks
-            
-        except Exception as e:
-            logger.error(f"Error loading directory: {str(e)}")
-            raise
-    
-    # ========================================================================
-    # TEXT PROCESSING
-    # ========================================================================
-    
-    def _clean_text(self, text: str) -> str:
-        """
-        Clean and normalize text.
-        
-        Args:
-            text: Raw text to clean
-            
-        Returns:
-            Cleaned text
-        """
-        # Remove extra whitespace
-        text = " ".join(text.split())
-        
-        # Remove special characters that break processing
-        text = text.replace('\x00', '')  # Null bytes
-        text = text.replace('\ufffd', '')  # Replacement character
-        
-        # Remove excessive newlines
-        while '\n\n\n' in text:
-            text = text.replace('\n\n\n', '\n\n')
-        
-        return text
-    
-    def chunk_text(
-        self,
-        text: str,
-        chunk_size: Optional[int] = None,
-        chunk_overlap: Optional[int] = None
-    ) -> List[str]:
-        """
-        Chunk raw text without loading from file.
-        
-        Args:
-            text: Text to chunk
-            chunk_size: Override default chunk size
-            chunk_overlap: Override default overlap
-            
-        Returns:
-            List of text chunks
-            
-        Example:
-            >>> loader = DocumentLoader()
-            >>> chunks = loader.chunk_text(
-            ...     "Long text...",
-            ...     chunk_size=200,
-            ...     chunk_overlap=50
-            ... )
-        """
-        try:
-            # Use custom splitter if different size requested
-            if chunk_size or chunk_overlap:
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=chunk_size or self.chunk_size,
-                    chunk_overlap=chunk_overlap or self.chunk_overlap
-                )
-            else:
-                splitter = self.text_splitter
-            
-            chunks = splitter.split_text(text)
-            logger.info(f"Chunked text into {len(chunks)} pieces")
-            return chunks
-            
-        except Exception as e:
-            logger.error(f"Error chunking text: {str(e)}")
-            raise
-    
-    def get_file_stats(self, file_path: str) -> Dict:
-        """
-        Get statistics about a file without fully loading it.
-        
-        Args:
             file_path: Path to file
+            with_metadata: Return Document objects with metadata
             
         Returns:
-            Dictionary with file statistics
-            
-        Example:
-            >>> stats = loader.get_file_stats("document.pdf")
-            >>> print(f"File size: {stats['file_size']} bytes")
+            List of chunks (str) or Document objects
         """
-        try:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"File not found: {file_path}")
-            
-            file_stats = {
-                'file_name': os.path.basename(file_path),
-                'file_type': os.path.splitext(file_path)[1],
-                'file_size': os.path.getsize(file_path),
-                'file_size_mb': os.path.getsize(file_path) / (1024 * 1024),
-                'modified_time': os.path.getmtime(file_path),
-            }
-            
-            return file_stats
-            
-        except Exception as e:
-            logger.error(f"Error getting file stats: {str(e)}")
-            raise
-    
-    # ========================================================================
-    # BATCH PROCESSING
-    # ========================================================================
-    
-    def load_files(self, file_paths: List[str]) -> List[str]:
+        file_ext = Path(file_path).suffix.lower()
+
+        if file_ext not in self.loaders:
+            raise ValueError(
+                f"Unsupported format: {file_ext}. Supported: {list(self.loaders.keys())}"
+            )
+
+        loader = self.loaders[file_ext]
+        text = loader.load(file_path)
+        text = self._clean_text(text)
+
+        if not text:
+            logger.warning(f"No text extracted from {file_path}")
+            return []
+
+        chunks = self.text_splitter.split_text(text)
+        logger.info(f"Split into {len(chunks)} chunks")
+
+        if with_metadata:
+            _, metadata = loader.load_with_metadata(file_path)
+            return [Document(page_content=chunk, metadata=metadata) for chunk in chunks]
+        else:
+            return chunks
+
+    def load_directory(
+        self, 
+        directory: str, 
+        recursive: bool = True,
+        with_metadata: bool = False,
+    ) -> List[Any]:
         """
-        Load multiple files and return all chunks.
+        Load and chunk all files in a directory.
         
         Args:
-            file_paths: List of file paths
+            directory: Directory path
+            recursive: Search subdirectories
+            with_metadata: Include metadata
             
         Returns:
-            Combined list of all chunks
-            
-        Example:
-            >>> loader = DocumentLoader()
-            >>> chunks = loader.load_files([
-            ...     "doc1.pdf",
-            ...     "doc2.txt",
-            ...     "doc3.docx"
-            ... ])
+            List of chunks or Document objects
         """
-        all_chunks = []
-        
-        for file_path in file_paths:
-            try:
-                chunks = self.load_file(file_path)
-                all_chunks.extend(chunks)
-                logger.info(f"Loaded {len(chunks)} chunks from {os.path.basename(file_path)}")
-            except Exception as e:
-                logger.warning(f"Failed to load {file_path}: {str(e)}")
-                continue
-        
-        logger.info(f"Total loaded: {len(all_chunks)} chunks from {len(file_paths)} files")
+        if not os.path.isdir(directory):
+            raise ValueError(f"Not a directory: {directory}")
+
+        all_chunks: List[Any] = []
+        path_iter = (
+            Path(directory).rglob("*") if recursive else Path(directory).glob("*")
+        )
+
+        file_count = 0
+        for file_path in path_iter:
+            if file_path.is_file() and file_path.suffix.lower() in self.loaders:
+                try:
+                    chunks = self.load_file(str(file_path), with_metadata=with_metadata)
+                    all_chunks.extend(chunks)
+                    file_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to load {file_path}: {str(e)}")
+                    continue
+
+        logger.info(
+            f"Loaded {file_count} files → {len(all_chunks)} chunks from {directory}"
+        )
         return all_chunks
+
+    # ========================================================================
+    # HELPER METHODS
+    # ========================================================================
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        """Clean unwanted whitespace and special characters."""
+        if not text:
+            return ""
+
+        # Remove null bytes and replacement characters
+        text = text.replace("\x00", "").replace("\ufffd", "")
+
+        # Normalize whitespace
+        text = " ".join(text.split())
+
+        return text.strip()
+
+    @staticmethod
+    def get_file_stats(file_path: str) -> Dict[str, Any]:
+        """Get file statistics."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        size_bytes = os.path.getsize(file_path)
+        size_mb = round(size_bytes / (1024 * 1024), 2)
+
+        return {
+            "file_name": os.path.basename(file_path),
+            "file_type": Path(file_path).suffix.upper(),
+            "file_size_bytes": size_bytes,
+            "file_size_mb": size_mb,
+            "modified_timestamp": os.path.getmtime(file_path),
+            "is_supported": Path(file_path).suffix.lower() in SUPPORTED_FORMATS,
+        }
+
+    @staticmethod
+    def validate_file(file_path: str) -> Tuple[bool, str]:
+        """
+        Validate if file can be loaded.
+        
+        Returns:
+            (is_valid, message)
+        """
+        if not os.path.exists(file_path):
+            return False, f"File not found: {file_path}"
+
+        if not os.path.isfile(file_path):
+            return False, f"Not a file: {file_path}"
+
+        if os.path.getsize(file_path) > MAX_FILE_SIZE:
+            return False, f"File too large (max: {MAX_FILE_SIZE / 1024 / 1024:.0f} MB)"
+
+        ext = Path(file_path).suffix.lower()
+        if ext not in SUPPORTED_FORMATS:
+            return False, f"Unsupported format: {ext}"
+
+        return True, "✅ File is valid"
 
 
 # ============================================================================
-# HELPER FUNCTIONS
+# UTILITY FUNCTIONS
 # ============================================================================
 
 def is_supported_format(file_path: str) -> bool:
-    """
-    Check if file format is supported.
-    
-    Args:
-        file_path: Path to file
-        
-    Returns:
-        bool: True if supported
-        
-    Example:
-        >>> is_supported_format("document.pdf")  # True
-        >>> is_supported_format("image.jpg")      # False
-    """
-    file_ext = os.path.splitext(file_path)[1].lower()
-    return file_ext in SUPPORTED_FORMATS
+    """Check if file format is supported."""
+    return Path(file_path).suffix.lower() in SUPPORTED_FORMATS
 
 
 def get_supported_formats() -> Dict[str, str]:
-    """
-    Get all supported file formats and descriptions.
-    
-    Returns:
-        Dictionary of formats and descriptions
-    """
+    """Get dictionary of supported formats."""
     return SUPPORTED_FORMATS.copy()
 
 
-def estimate_chunks(file_size_mb: float, chunk_size: int = 500) -> int:
-    """
-    Estimate how many chunks a file will produce.
-    
-    Args:
-        file_size_mb: File size in megabytes
-        chunk_size: Characters per chunk
-        
-    Returns:
-        Estimated number of chunks
-        
-    Example:
-        >>> chunks = estimate_chunks(5.0)  # 5 MB file
-        >>> print(f"Approximately {chunks} chunks")
-    """
-    # Rough estimate: 1 MB ≈ 1 million characters
-    # Each chunk ≈ chunk_size characters
-    return int((file_size_mb * 1_000_000) / chunk_size)
+def estimate_chunks(
+    file_size_mb: float, 
+    chunk_size: int = 500,
+) -> int:
+    """Estimate number of chunks from file size."""
+    if file_size_mb <= 0:
+        return 0
+    return max(1, int((file_size_mb * 1_000_000) / chunk_size))
+
+
 # ============================================================================
-# The End
+# END OF MODULE
 # ============================================================================

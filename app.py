@@ -1,572 +1,604 @@
 """
-Main Application Entry Point for Multimodel Chatbot
+Multimodal Chatbot with RAG System - Main Application
 
-This is the primary application file that creates and runs the Gradio web interface
-for the multimodel chatbot with RAG capabilities.
+This application provides a complete Retrieval-Augmented Generation (RAG)
+chatbot with support for both local and OpenAI models, document ingestion,
+and conversation management.
 
-The application integrates:
-- RAG pipeline for document retrieval and context
-- Multiple language models (OpenAI GPT and Hugging Face models)
-- Conversation memory for multi-turn conversations
-- Document upload and processing
-- Real-time chat interface
+Features:
+- Document ingestion from PDF, TXT, DOCX, Markdown
+- Semantic search with HuggingFace embeddings
+- RAG-powered responses with context
+- Multi-turn conversation support
+- Gradio web interface
+- Full .env configuration support
+- LangChain 1.0.3 compatible
 
 Author: Ashmin Dhungana
+License: MIT
 """
 
 import os
-from pathlib import Path
-from dotenv import load_dotenv
-import gradio as gr
+import sys
 import logging
-from typing import List, Tuple
-from src.rag_pipeline import RAGPipeline
-from src.llm_models import LLMManager
-from src.document_loader import DocumentLoader
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
 
 # ============================================================================
-# CONFIGURATION AND SETUP
+# LOGGING CONFIGURATION
 # ============================================================================
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# Get configuration from environment variables
+# ============================================================================
+# ENVIRONMENT SETUP
+# ============================================================================
+
+# Load .env configuration
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    logger.info("✅ .env file loaded")
+except ImportError:
+    logger.warning("⚠️  python-dotenv not installed, using environment variables only")
+
+# Read configuration from .env
 MODEL_TYPE = os.getenv("MODEL_TYPE", "hybrid")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 500))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 100))
-TOP_K = int(os.getenv("TOP_K", 5))
-TEMPERATURE = float(os.getenv("TEMPERATURE", 0.7))
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", 2048))
-DATA_DIR = os.getenv("DATA_DIR", "./data")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
+TOP_K = int(os.getenv("TOP_K", "5"))
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 VECTORSTORE_PATH = os.getenv("VECTORSTORE_PATH", "./vectorstore")
+GRADIO_PORT = int(os.getenv("GRADIO_PORT", "7860"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Create necessary directories
-Path(DATA_DIR).mkdir(exist_ok=True)
-Path(VECTORSTORE_PATH).mkdir(exist_ok=True)
+logger.info(
+    f"📋 Configuration loaded:\n"
+    f"   MODEL_TYPE={MODEL_TYPE}\n"
+    f"   DEFAULT_MODEL={DEFAULT_MODEL}\n"
+    f"   TEMPERATURE={TEMPERATURE}\n"
+    f"   TOP_K={TOP_K}"
+)
 
 # ============================================================================
-# GLOBAL VARIABLES (Initialized on startup)
+# COMPONENT IMPORTS
 # ============================================================================
 
-# These will store the RAG pipeline, LLM manager, and conversation history
-rag_pipeline: RAGPipeline = None
-llm_manager: LLMManager = None
-conversation_history: List[Tuple[str, str]] = []
-uploaded_documents: List[str] = []
+def safe_import(module_path: str, class_name: str):
+    """Safely import a class with error handling."""
+    try:
+        module = __import__(module_path, fromlist=[class_name])
+        cls = getattr(module, class_name)
+        logger.info(f"✅ Loaded: {class_name}")
+        return cls
+    except (ImportError, AttributeError) as e:
+        logger.warning(f"⚠️  Failed to load {class_name}: {str(e)}")
+        return None
+
+
+# Import components
+logger.info("📦 Importing components...")
+
+RAGPipelineLCEL = safe_import("src.rag_pipeline", "RAGPipelineLCEL")
+LLMManager = safe_import("src.llm_models", "LLMManager")
+ConversationManager = safe_import("src.llm_models", "ConversationManager")
+DocumentLoader = safe_import("src.document_loader", "DocumentLoader")
+
+# ============================================================================
+# OPTIONAL COMPONENTS
+# ============================================================================
+
+# Try to import Gradio
+try:
+    import gradio as gr
+    gradio_available = True
+    logger.info("✅ Gradio available")
+except ImportError:
+    gradio_available = False
+    logger.warning("⚠️  Gradio not installed. Install via: pip install gradio")
+
+# Try to import embeddings for diagnostics
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    logger.info(f"✅ Embeddings initialized: {EMBEDDING_MODEL}")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize embeddings: {str(e)}")
+    embeddings = None
 
 # ============================================================================
 # INITIALIZATION FUNCTIONS
 # ============================================================================
 
-def initialize_system():
-    """
-    Initialize all system components on application startup.
-    
-    This function:
-    1. Initializes the LLM Manager with configured models
-    2. Initializes the RAG Pipeline with vector store
-    3. Loads any previously uploaded documents
-    
-    Returns:
-        bool: True if initialization successful, False otherwise
-    """
-    global rag_pipeline, llm_manager
-    
+def initialize_pipeline() -> Optional[object]:
+    """Initialize RAG pipeline."""
+    if not RAGPipelineLCEL:
+        logger.error("❌ RAG Pipeline class not available")
+        return None
+
     try:
-        logger.info("Initializing Multimodel Chatbot system...")
-        
-        # Initialize LLM Manager
-        logger.info(f"Loading LLM Manager with model type: {MODEL_TYPE}")
-        llm_manager = LLMManager(
-            model_type=MODEL_TYPE,
-            default_model=DEFAULT_MODEL,
-            openai_api_key=OPENAI_API_KEY,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS
-        )
-        
-        # Initialize RAG Pipeline
-        logger.info("Initializing RAG Pipeline...")
-        rag_pipeline = RAGPipeline(
+        logger.info("🔄 Initializing RAG Pipeline...")
+        pipeline = RAGPipelineLCEL(
             vectorstore_path=VECTORSTORE_PATH,
             chunk_size=CHUNK_SIZE,
             chunk_overlap=CHUNK_OVERLAP,
             top_k=TOP_K,
-            embedding_model=os.getenv(
-                "EMBEDDING_MODEL",
-                "sentence-transformers/all-MiniLM-L6-v2"
-            )
+            embedding_model=EMBEDDING_MODEL,
+            llm_model=DEFAULT_MODEL,
+            use_openai=(MODEL_TYPE == "openai" or MODEL_TYPE == "hybrid"),
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
         )
-        
-        # Load existing documents if available
-        if os.path.exists(VECTORSTORE_PATH):
-            logger.info("Loading existing vector store...")
-            rag_pipeline.load_vectorstore()
-        
-        logger.info("System initialization successful!")
-        return True
-        
+        logger.info("✅ RAG Pipeline initialized")
+        return pipeline
     except Exception as e:
-        logger.error(f"Failed to initialize system: {str(e)}")
+        logger.error(f"❌ RAG Pipeline initialization failed: {str(e)}")
+        return None
+
+
+def initialize_llm_manager() -> Optional[object]:
+    """Initialize LLM manager."""
+    if not LLMManager:
+        logger.error("❌ LLM Manager class not available")
+        return None
+
+    try:
+        logger.info("🔄 Initializing LLM Manager...")
+        manager = LLMManager(
+            model_type=MODEL_TYPE,
+            default_model=DEFAULT_MODEL,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+        )
+        logger.info(f"✅ LLM Manager initialized (model: {DEFAULT_MODEL})")
+        return manager
+    except Exception as e:
+        logger.error(f"❌ LLM Manager initialization failed: {str(e)}")
+        return None
+
+
+def initialize_conversation_manager() -> Optional[object]:
+    """Initialize conversation manager."""
+    if not ConversationManager:
+        logger.error("❌ Conversation Manager class not available")
+        return None
+
+    try:
+        logger.info("🔄 Initializing Conversation Manager...")
+        manager = ConversationManager(max_history=10, use_memory=True)
+        logger.info("✅ Conversation Manager initialized")
+        return manager
+    except Exception as e:
+        logger.error(f"❌ Conversation Manager initialization failed: {str(e)}")
+        return None
+
+
+def initialize_document_loader() -> Optional[object]:
+    """Initialize document loader."""
+    if not DocumentLoader:
+        logger.error("❌ Document Loader class not available")
+        return None
+
+    try:
+        logger.info("🔄 Initializing Document Loader...")
+        loader = DocumentLoader(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+        )
+        logger.info("✅ Document Loader initialized")
+        return loader
+    except Exception as e:
+        logger.error(f"❌ Document Loader initialization failed: {str(e)}")
+        return None
+
+# ============================================================================
+# CHATBOT CLASS
+# ============================================================================
+
+class MultimodalChatbot:
+    """
+    Complete multimodal chatbot with RAG, LLM, and conversation management.
+    
+    Features:
+    - Document ingestion and management
+    - Semantic search with RAG
+    - Multi-turn conversations
+    - Fallback modes
+    """
+
+    def __init__(self):
+        """Initialize all components."""
+        logger.info("=" * 70)
+        logger.info("🤖 MULTIMODAL CHATBOT WITH RAG")
+        logger.info("=" * 70)
+
+        # Initialize components
+        self.rag_pipeline = initialize_pipeline()
+        self.llm_manager = initialize_llm_manager()
+        self.conversation_manager = initialize_conversation_manager()
+        self.document_loader = initialize_document_loader()
+
+        # Check readiness
+        self.is_ready = bool(self.llm_manager)  # LLM is essential
+        self.rag_ready = bool(self.rag_pipeline)
+
+        if self.is_ready:
+            logger.info("✅ Chatbot is ready!")
+        else:
+            logger.error("❌ Chatbot failed to initialize")
+
+        # Statistics
+        self.stats = {
+            "messages_processed": 0,
+            "documents_added": 0,
+            "start_time": datetime.now(),
+        }
+
+    def add_documents(
+        self,
+        documents: List[str],
+        metadata: Optional[List[Dict]] = None,
+    ) -> bool:
+        """
+        Add documents to RAG pipeline.
+        
+        Args:
+            documents: List of document texts
+            metadata: Optional metadata for each document
+            
+        Returns:
+            True if successful
+        """
+        if not self.rag_pipeline:
+            logger.error("❌ RAG Pipeline not available")
+            return False
+
+        try:
+            logger.info(f"📄 Adding {len(documents)} documents...")
+            success = self.rag_pipeline.add_documents(documents, metadata)
+
+            if success:
+                # Build chain if not already built
+                if self.rag_pipeline.rag_chain is None:
+                    self.rag_pipeline.build_rag_chain()
+
+                self.stats["documents_added"] += len(documents)
+                logger.info(f"✅ Added {len(documents)} documents")
+                return True
+            else:
+                logger.error("❌ Failed to add documents")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Error adding documents: {str(e)}")
+            return False
+
+    def add_file(self, file_path: str) -> bool:
+        """
+        Add documents from file.
+        
+        Args:
+            file_path: Path to file (PDF, TXT, DOCX, Markdown)
+            
+        Returns:
+            True if successful
+        """
+        if not self.document_loader:
+            logger.error("❌ Document Loader not available")
+            return False
+
+        try:
+            logger.info(f"📂 Loading file: {file_path}")
+            docs = self.document_loader.load_file(file_path, with_metadata=True)
+
+            if docs:
+                metadata = [d.metadata for d in docs] if hasattr(docs[0], 'metadata') else None
+                content = [d.page_content if hasattr(d, 'page_content') else str(d) for d in docs]
+                return self.add_documents(content, metadata)
+            else:
+                logger.warning(f"⚠️  No documents extracted from {file_path}")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Error loading file: {str(e)}")
+            return False
+
+    def chat(
+        self,
+        user_query: str,
+        use_rag: bool = True,
+        verbose: bool = False,
+    ) -> str:
+        """
+        Process user query and generate response.
+        
+        Args:
+            user_query: User input
+            use_rag: Use RAG context
+            verbose: Print debug info
+            
+        Returns:
+            Chatbot response
+        """
+        if not self.is_ready:
+            return "⚠️  Chatbot not fully initialized. Please check the logs."
+
+        try:
+            self.stats["messages_processed"] += 1
+
+            if verbose:
+                logger.info(f"💬 Query: {user_query[:50]}...")
+
+            # Get RAG context if available and requested
+            context = ""
+            if use_rag and self.rag_ready and self.rag_pipeline.rag_chain:
+                if verbose:
+                    logger.info("🔍 Searching RAG context...")
+                try:
+                    response = self.rag_pipeline.query_with_chain(user_query)
+                    self.conversation_manager.add_message(user_query, response)
+                    return response
+                except Exception as e:
+                    logger.warning(f"⚠️  RAG query failed, falling back: {str(e)}")
+
+            # Fallback: use LLM directly with conversation context
+            if verbose:
+                logger.info("🤖 Invoking LLM...")
+
+            response = self.llm_manager.invoke(
+                user_query,
+                context=context,
+                conversation=self.conversation_manager,
+            )
+
+            # Add to conversation history
+            if self.conversation_manager:
+                self.conversation_manager.add_message(user_query, response)
+
+            return response
+
+        except Exception as e:
+            logger.error(f"❌ Chat error: {str(e)}")
+            return f"❌ Error generating response: {str(e)}"
+
+    def get_status(self) -> Dict:
+        """Get chatbot status."""
+        return {
+            "is_ready": self.is_ready,
+            "rag_ready": self.rag_ready,
+            "model": self.llm_manager.get_current_model_name() if self.llm_manager else "N/A",
+            "messages_processed": self.stats["messages_processed"],
+            "documents_added": self.stats["documents_added"],
+            "uptime_seconds": (datetime.now() - self.stats["start_time"]).total_seconds(),
+        }
+
+    def get_rag_stats(self) -> Optional[Dict]:
+        """Get RAG pipeline statistics."""
+        if not self.rag_pipeline:
+            return None
+        return self.rag_pipeline.get_stats()
+
+    def reset_conversation(self) -> bool:
+        """Clear conversation history."""
+        if self.conversation_manager:
+            self.conversation_manager.clear_history()
+            logger.info("✅ Conversation history cleared")
+            return True
+        return False
+
+    def save_conversation(self, path: str) -> bool:
+        """Save conversation to JSON."""
+        if self.conversation_manager:
+            try:
+                self.conversation_manager.export_to_json(path)
+                logger.info(f"✅ Conversation saved to {path}")
+                return True
+            except Exception as e:
+                logger.error(f"❌ Failed to save conversation: {str(e)}")
+                return False
         return False
 
 # ============================================================================
-# DOCUMENT MANAGEMENT FUNCTIONS
+# GRADIO INTERFACE
 # ============================================================================
 
-def process_uploaded_file(file):
-    """
-    Process and ingest an uploaded document into the RAG system.
-    
-    Args:
-        file: Gradio File object containing the uploaded document
-        
-    Returns:
-        str: Status message about the upload and processing
-    """
-    global rag_pipeline, uploaded_documents
-    
-    if file is None:
-        return "❌ No file uploaded. Please select a file."
-    
-    try:
-        logger.info(f"Processing uploaded file: {file.name}")
-        
-        # Save uploaded file temporarily
-        temp_path = os.path.join(DATA_DIR, file.name)
-        
-        # The file object from Gradio contains the path
-        if hasattr(file, 'name'):
-            temp_path = file.name
-        
-        # Load and process document
-        loader = DocumentLoader(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-        chunks = loader.load_file(temp_path)
-        
-        if not chunks:
-            return f"❌ Could not extract text from {file.name}"
-        
-        # Add to RAG pipeline
-        rag_pipeline.add_documents(chunks, metadata={"source": file.name})
-        
-        # Save vector store
-        rag_pipeline.save_vectorstore()
-        
-        uploaded_documents.append(file.name)
-        
-        logger.info(f"Successfully processed {len(chunks)} chunks from {file.name}")
-        return f"✅ Successfully processed '{file.name}'\n📊 Extracted {len(chunks)} text chunks\n💾 Added to knowledge base"
-        
-    except Exception as e:
-        logger.error(f"Error processing file: {str(e)}")
-        return f"❌ Error processing file: {str(e)}"
+def launch_gradio(chatbot: MultimodalChatbot):
+    """Launch Gradio web interface."""
+    if not gradio_available:
+        logger.error("❌ Gradio not available")
+        return
 
-def get_uploaded_documents_list() -> str:
-    """
-    Get a formatted list of uploaded documents.
-    
-    Returns:
-        str: Formatted list of documents or message if none uploaded
-    """
-    if not uploaded_documents:
-        return "No documents uploaded yet. Upload documents to get started!"
-    
-    doc_list = "\n".join([f"• {doc}" for doc in uploaded_documents])
-    return f"📚 Uploaded Documents ({len(uploaded_documents)}):\n{doc_list}"
+    logger.info(f"🌐 Launching Gradio interface on port {GRADIO_PORT}...")
 
-def clear_knowledge_base():
+    # Custom CSS
+    custom_css = """
+    .chatbot-header { 
+        text-align: center; 
+        color: #4CAF50; 
+        font-size: 24px; 
+        margin: 10px 0;
+    }
+    .status-box {
+        padding: 10px;
+        border-radius: 5px;
+        background-color: #f0f0f0;
+        margin: 10px 0;
+    }
     """
-    Clear all documents from the knowledge base.
-    
-    Returns:
-        str: Confirmation message
-    """
-    global rag_pipeline, uploaded_documents, conversation_history
-    
-    try:
-        rag_pipeline.clear_vectorstore()
-        uploaded_documents = []
-        conversation_history = []
-        
-        logger.info("Knowledge base cleared")
-        return "✅ Knowledge base cleared successfully!"
-        
-    except Exception as e:
-        logger.error(f"Error clearing knowledge base: {str(e)}")
-        return f"❌ Error clearing knowledge base: {str(e)}"
 
-# ============================================================================
-# CHAT AND RESPONSE GENERATION FUNCTIONS
-# ============================================================================
+    def chat_fn(message: str) -> str:
+        """Gradio chat function."""
+        return chatbot.chat(message, use_rag=True)
 
-def process_message(message: str, history: List[List]) -> str:
-    """
-    Process user message and generate AI response using RAG pipeline.
-    
-    This function:
-    1. Retrieves relevant documents from the knowledge base
-    2. Prepares context from retrieved documents
-    3. Generates response using selected LLM
-    4. Updates conversation history
-    
-    Args:
-        message: User's input message
-        history: Conversation history from Gradio ChatInterface
-        
-    Returns:
-        str: AI-generated response
-    """
-    global rag_pipeline, llm_manager, conversation_history
-    
-    if not message.strip():
-        return "Please enter a message."
-    
-    try:
-        logger.info(f"Processing user message: {message[:50]}...")
-        
-        # Retrieve relevant context from documents
-        if uploaded_documents and len(uploaded_documents) > 0:
-            retrieved_docs = rag_pipeline.retrieve(message, top_k=TOP_K)
-            context = "\n".join([doc['content'] for doc in retrieved_docs])
-            logger.info(f"Retrieved {len(retrieved_docs)} relevant documents")
-        else:
-            context = ""
-            logger.info("No documents in knowledge base. Using general knowledge.")
-        
-        # Generate response using LLM
-        response = llm_manager.generate_response(
-            query=message,
-            context=context,
-            conversation_history=conversation_history
-        )
-        
-        # Update conversation history
-        conversation_history.append((message, response))
-        
-        logger.info("Response generated successfully")
-        return response
-        
-    except Exception as e:
-        logger.error(f"Error processing message: {str(e)}")
-        return f"⚠️ Error generating response: {str(e)}\n\nPlease check your configuration and try again."
+    def status_fn() -> str:
+        """Get status."""
+        status = chatbot.get_status()
+        return f"""
+        **Status:** {'✅ Ready' if status['is_ready'] else '❌ Not Ready'}
+        **Model:** {status['model']}
+        **Messages:** {status['messages_processed']}
+        **Documents:** {status['documents_added']}
+        **RAG:** {'✅ Active' if status['rag_ready'] else '⚠️ Inactive'}
+        """
 
-def clear_conversation():
-    """
-    Clear conversation history.
-    
-    Returns:
-        str: Confirmation message
-    """
-    global conversation_history
-    conversation_history = []
-    return "✅ Conversation cleared!"
+    def rag_stats_fn() -> str:
+        """Get RAG statistics."""
+        stats = chatbot.get_rag_stats()
+        if not stats:
+            return "RAG Pipeline not available"
+        return f"""
+        **Status:** {stats.get('status', 'N/A')}
+        **Documents:** {stats.get('num_documents', 0)}
+        **Model:** {stats.get('embedding_model', 'N/A')}
+        **Device:** {stats.get('device', 'N/A')}
+        """
 
-def get_system_info() -> str:
-    """
-    Get current system configuration information.
-    
-    Returns:
-        str: Formatted system information
-    """
-    info = f"""
-    🤖 **System Information**
-    
-    **Configuration:**
-    • Model Type: {MODEL_TYPE}
-    • Default Model: {DEFAULT_MODEL}
-    • Temperature: {TEMPERATURE}
-    • Max Tokens: {MAX_TOKENS}
-    
-    **RAG Settings:**
-    • Chunk Size: {CHUNK_SIZE}
-    • Chunk Overlap: {CHUNK_OVERLAP}
-    • Top K Results: {TOP_K}
-    
-    **Storage:**
-    • Data Directory: {DATA_DIR}
-    • Vector Store: {VECTORSTORE_PATH}
-    • Documents Uploaded: {len(uploaded_documents)}
-    """
-    return info
-
-# ============================================================================
-# MODEL MANAGEMENT FUNCTIONS
-# ============================================================================
-
-def switch_model(model_name: str) -> str:
-    """
-    Switch to a different language model.
-    
-    Args:
-        model_name: Name of the model to switch to
-        
-    Returns:
-        str: Confirmation message
-    """
-    global llm_manager
-    
-    try:
-        logger.info(f"Switching to model: {model_name}")
-        llm_manager.set_model(model_name)
-        return f"✅ Successfully switched to {model_name}"
-    except Exception as e:
-        logger.error(f"Error switching model: {str(e)}")
-        return f"❌ Error switching model: {str(e)}"
-
-def get_available_models() -> str:
-    """
-    Get list of available models.
-    
-    Returns:
-        str: Formatted list of available models
-    """
-    try:
-        models = llm_manager.get_available_models()
-        model_list = "\n".join([f"• {model}" for model in models])
-        return f"**Available Models:**\n{model_list}"
-    except Exception as e:
-        return f"❌ Error retrieving models: {str(e)}"
-
-# ============================================================================
-# GRADIO INTERFACE CREATION
-# ============================================================================
-
-def create_gradio_interface():
-    """
-    Create and configure the Gradio web interface.
-    
-    Returns:
-        gr.Blocks: Configured Gradio interface
-    """
-    
-    with gr.Blocks(title="Multimodel Chatbot with RAG", theme=gr.themes.Soft()) as demo:
+    # Create interface
+    with gr.Blocks(css=custom_css, title="🤖 Multimodal Chatbot RAG") as demo:
         
         # Header
-        gr.Markdown("# 🤖 Multimodel Chatbot with RAG")
-        gr.Markdown("An intelligent chatbot that combines multiple language models with retrieval-augmented generation")
-        
-        with gr.Tabs():
-            
-            # ===== TAB 1: CHAT INTERFACE =====
-            with gr.Tab("💬 Chat"):
-                gr.Markdown("### Chat with the AI Assistant")
-                
-                chat_interface = gr.ChatInterface(
-                    fn=process_message,
-                    examples=[
-                        "What is this document about?",
-                        "Can you summarize the key points?",
-                        "Answer my question based on the uploaded documents"
-                    ],
-                    title="Chat with Multimodel Chatbot",
-                    description="Upload documents, then ask questions about them!"
-                )
-            
-            # ===== TAB 2: DOCUMENT MANAGEMENT =====
-            with gr.Tab("📄 Documents"):
-                gr.Markdown("### Document Management")
-                
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("#### Upload Documents")
-                        file_input = gr.File(
-                            label="Select a document (PDF, TXT)",
-                            file_count="single"
-                        )
-                        upload_btn = gr.Button("📤 Upload and Process", variant="primary")
-                        upload_status = gr.Textbox(
-                            label="Upload Status",
-                            interactive=False,
-                            lines=3
-                        )
-                        
-                        upload_btn.click(
-                            fn=process_uploaded_file,
-                            inputs=file_input,
-                            outputs=upload_status
-                        )
-                    
-                    with gr.Column():
-                        gr.Markdown("#### Knowledge Base")
-                        doc_list = gr.Textbox(
-                            label="Uploaded Documents",
-                            interactive=False,
-                            lines=6
-                        )
-                        refresh_btn = gr.Button("🔄 Refresh")
-                        clear_btn = gr.Button("🗑️ Clear All Documents", variant="stop")
-                        
-                        refresh_btn.click(
-                            fn=get_uploaded_documents_list,
-                            outputs=doc_list
-                        )
-                        clear_btn.click(
-                            fn=clear_knowledge_base,
-                            outputs=upload_status
-                        )
-            
-            # ===== TAB 3: MODEL SELECTION =====
-            with gr.Tab("🎛️ Settings"):
-                gr.Markdown("### Model & Configuration Settings")
-                
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("#### Model Selection")
-                        model_dropdown = gr.Dropdown(
-                            choices=[
-                                "gpt-3.5-turbo",
-                                "gpt-4",
-                                "mistralai/Mistral-7B-Instruct-v0.2",
-                                "meta-llama/Llama-2-7b-chat-hf"
-                            ],
-                            value=DEFAULT_MODEL,
-                            label="Select Model"
-                        )
-                        switch_btn = gr.Button("🔄 Switch Model", variant="primary")
-                        model_status = gr.Textbox(
-                            label="Status",
-                            interactive=False
-                        )
-                        
-                        switch_btn.click(
-                            fn=switch_model,
-                            inputs=model_dropdown,
-                            outputs=model_status
-                        )
-                    
-                    with gr.Column():
-                        gr.Markdown("#### Available Models")
-                        models_display = gr.Textbox(
-                            label="Models",
-                            interactive=False,
-                            lines=6
-                        )
-                        refresh_models_btn = gr.Button("🔄 Refresh")
-                        
-                        refresh_models_btn.click(
-                            fn=get_available_models,
-                            outputs=models_display
-                        )
-                
-                gr.Markdown("#### System Information")
-                info_display = gr.Textbox(
-                    label="System Config",
-                    interactive=False,
-                    lines=8
-                )
-                info_btn = gr.Button("📊 Show System Info")
-                info_btn.click(
-                    fn=get_system_info,
-                    outputs=info_display
-                )
-            
-            # ===== TAB 4: HELP & INFO =====
-            with gr.Tab("❓ Help"):
-                gr.Markdown("""
-                    ### 📚 How to Use Multimodel Chatbot
-                    
-                    **1. Upload Documents**
-                    - Go to the **Documents** tab
-                    - Upload PDF or TXT files
-                    - The system will automatically process and index them
-                    
-                    **2. Ask Questions**
-                    - Go to the **Chat** tab
-                    - Type your question or prompt
-                    - The AI will search through your documents and provide answers
-                    
-                    **3. Switch Models**
-                    - Go to the **Settings** tab
-                    - Select a different model from the dropdown
-                    - Click "Switch Model" to use it
-                    
-                    **4. Clear Data**
-                    - In the **Documents** tab, click "Clear All Documents" to reset
-                    - In the **Chat** tab, conversations are auto-cleared
-                    
-                    ### 🔧 Features
-                    - **Multiple Models**: Switch between OpenAI GPT and open-source models
-                    - **RAG Technology**: Retrieval-Augmented Generation for accurate answers
-                    - **Document Processing**: Handle PDFs and text files
-                    - **Conversation Memory**: Context-aware multi-turn conversations
-                    - **Privacy**: Option to run completely locally
-                    
-                    ### ⚙️ Configuration
-                    - Edit `.env` file to change:
-                      - Model type (hybrid/openai/local)
-                      - API keys
-                      - Chunk size and retrieval settings
-                      - Temperature and token limits
-                    
-                    ### 📝 Tips
-                    - Upload relevant documents for better answers
-                    - Ask specific questions for accurate results
-                    - Use clear language in your prompts
-                    - Check the System Info to verify your configuration
-                """)
-        
-        # Footer
+        gr.Markdown("# 🤖 Multimodal Chatbot with RAG")
         gr.Markdown(
-            """
-            ---
-            **Multimodel Chatbot v1.0.0** | Built with ❤️ using Gradio, LangChain, and OpenAI
-            
-            [GitHub](https://github.com/) | [Documentation](docs/) | [Issues](https://github.com/issues)
-            """
+            "Ask questions and get intelligent answers powered by "
+            "Retrieval-Augmented Generation and large language models."
         )
-    
-    return demo
+
+        # Main chat section
+        with gr.Row():
+            with gr.Column(scale=2):
+                gr.Markdown("## 💬 Chat")
+                chatbot_interface = gr.Chatbot(height=500)
+                message_input = gr.Textbox(
+                    label="Your Question",
+                    placeholder="Ask me anything...",
+                    lines=2,
+                )
+                submit_btn = gr.Button("Send", variant="primary")
+
+            with gr.Column(scale=1):
+                gr.Markdown("## 📊 Status")
+                status_output = gr.Markdown()
+                refresh_status_btn = gr.Button("Refresh Status")
+
+                gr.Markdown("## 📈 RAG Stats")
+                rag_stats_output = gr.Markdown()
+                refresh_rag_btn = gr.Button("Refresh RAG Stats")
+
+                gr.Markdown("## 🎯 Actions")
+                reset_btn = gr.Button("Clear History", variant="secondary")
+                save_btn = gr.Button("Save Conversation")
+
+        # Connect functions
+        def chat_with_history(message, history):
+            history = history or []
+            response = chat_fn(message)
+            history.append([message, response])
+            return history, ""
+
+        submit_btn.click(
+            chat_with_history,
+            inputs=[message_input, chatbot_interface],
+            outputs=[chatbot_interface, message_input],
+        )
+
+        message_input.submit(
+            chat_with_history,
+            inputs=[message_input, chatbot_interface],
+            outputs=[chatbot_interface, message_input],
+        )
+
+        refresh_status_btn.click(status_fn, outputs=status_output)
+        refresh_rag_btn.click(rag_stats_fn, outputs=rag_stats_output)
+        reset_btn.click(lambda: (chatbot.reset_conversation(), ""), outputs=[gr.Textbox(visible=False), message_input])
+        save_btn.click(
+            lambda: (chatbot.save_conversation("conversation.json"), "Saved!"),
+            outputs=[gr.Textbox(visible=False), gr.Textbox(visible=False)]
+        )
+
+    # Launch
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=GRADIO_PORT,
+        share=False,
+        show_error=True,
+    )
+
 
 # ============================================================================
-# MAIN APPLICATION ENTRY POINT
+# MAIN FUNCTION
 # ============================================================================
 
 def main():
-    """
-    Main application entry point.
-    
-    Initializes the system and launches the Gradio web interface.
-    """
-    
-    # Print startup message
-    print("\n" + "="*70)
-    print("🚀 Starting Multimodel Chatbot with RAG")
-    print("="*70)
-    
-    # Initialize system components
-    if not initialize_system():
-        logger.error("Failed to initialize system. Exiting.")
-        print("❌ System initialization failed. Please check your configuration.")
-        return
-    
-    # Create Gradio interface
-    logger.info("Creating Gradio interface...")
-    demo = create_gradio_interface()
-    
-    # Launch the application
-    print("\n" + "="*70)
-    print("✅ Application initialized successfully!")
-    print("="*70)
-    print("\n🌐 Opening web interface...")
-    print("📍 Access at: http://localhost:7860")
-    print("\nPress Ctrl+C to stop the server\n")
-    
-    # Launch Gradio app
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=os.getenv("GRADIO_SHARE", "False").lower() == "true"
-    )
+    """Main entry point."""
+    try:
+        logger.info("🚀 Starting Multimodal Chatbot...")
+
+        # Initialize chatbot
+        chatbot = MultimodalChatbot()
+
+        # Add sample documents if RAG is available
+        if chatbot.rag_ready:
+            logger.info("📚 Adding sample documents...")
+            sample_docs = [
+                "Machine learning is a subset of artificial intelligence that enables systems to learn from data without being explicitly programmed.",
+                "Deep learning uses neural networks with multiple layers (hence 'deep') to process complex patterns in data.",
+                "Retrieval-Augmented Generation (RAG) combines information retrieval with generation to produce more accurate and contextual responses.",
+                "LangChain is a framework for developing applications powered by language models, enabling composition and chaining of LLM interactions.",
+                "Natural language processing (NLP) focuses on enabling computers to understand and process human language in a meaningful way.",
+            ]
+            chatbot.add_documents(sample_docs)
+
+        # Display status
+        status = chatbot.get_status()
+        logger.info(
+            f"\n{'=' * 70}\n"
+            f"Chatbot Status:\n"
+            f"  Ready: {status['is_ready']}\n"
+            f"  Model: {status['model']}\n"
+            f"  RAG: {status['rag_ready']}\n"
+            f"{'=' * 70}\n"
+        )
+
+        # Launch Gradio if available, otherwise provide CLI
+        if gradio_available:
+            launch_gradio(chatbot)
+        else:
+            logger.warning("⚠️  Gradio not available. Running in CLI mode...")
+            logger.info("Install Gradio with: pip install gradio")
+
+            # Simple CLI interface
+            while True:
+                try:
+                    user_input = input("\n🤖 You: ").strip()
+                    if user_input.lower() in ["exit", "quit", "bye"]:
+                        logger.info("👋 Goodbye!")
+                        break
+                    if not user_input:
+                        continue
+
+                    response = chatbot.chat(user_input)
+                    print(f"\n💬 Chatbot: {response}")
+
+                except KeyboardInterrupt:
+                    logger.info("👋 Interrupted by user")
+                    break
+
+    except Exception as e:
+        logger.critical(f"❌ Fatal error: {str(e)}")
+        sys.exit(1)
+
+
+# ============================================================================
+# EXECUTION GUARD
+# ============================================================================
 
 if __name__ == "__main__":
     main()

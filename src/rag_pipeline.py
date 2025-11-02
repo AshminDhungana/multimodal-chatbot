@@ -1,438 +1,482 @@
 
-"""
-RAG Pipeline Module for Multimodel Chatbot
-
-This module implements the core Retrieval-Augmented Generation (RAG) pipeline.
-It handles:
-- Document loading and chunking
-- Vector embeddings creation
-- Vector store management (FAISS)
-- Semantic search and document retrieval
-- Context preparation for LLM
-
-The RAG approach enhances LLM responses by retrieving relevant documents
-from a knowledge base, ensuring answers are grounded in actual data.
-"""
-
 import os
 import logging
-from typing import List, Dict, Optional, Tuple
-import numpy as np
+import shutil
 from pathlib import Path
-
-# Third-party imports
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.schema import Document
+from typing import List, Dict, Optional, Any
+from datetime import datetime
 
 # ============================================================================
-# CONFIGURATION
+# LANGCHAIN 1.0.3 IMPORTS (CORRECT - NO StrOutputParser)
+# ============================================================================
+
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_community.llms import HuggingFacePipeline
+
+# Optional imports
+try:
+    from langchain_text_splitters import TokenTextSplitter
+    TokenTextSplitter_available = True
+except ImportError:
+    TokenTextSplitter_available = False
+
+try:
+    import torch
+    torch_available = True
+except ImportError:
+    torch_available = False
+
+# ============================================================================
+# CONFIGURATION & LOGGING
 # ============================================================================
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
+DEFAULT_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
+DEFAULT_TOP_K = int(os.getenv("TOP_K", "5"))
+DEFAULT_EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+DEFAULT_VECTORSTORE_PATH = os.getenv("VECTORSTORE_PATH", "./vectorstore")
+DEFAULT_DATA_DIR = os.getenv("DATA_DIR", "./data")
+
+# ============================================================================
+# SAFE OUTPUT PARSER (ONLY PARSER WE USE)
+# ============================================================================
+
+def safe_output_parser(output: Any) -> str:
+    """
+    Only parser needed - handles all response types safely.
+    
+    This is the ONLY output parser in the entire file.
+    """
+    if isinstance(output, dict):
+        for key in ["text", "output", "content", "response", "answer", "result"]:
+            if key in output and output[key]:
+                return str(output[key]).strip()
+        for value in output.values():
+            if value:
+                return str(value).strip()
+        return str(output)
+    elif isinstance(output, str):
+        return output.strip()
+    else:
+        return str(output).strip()
 
 # ============================================================================
 # RAG PIPELINE CLASS
 # ============================================================================
 
-class RAGPipeline:
-    """
-    Retrieval-Augmented Generation Pipeline
-    
-    This class manages the complete RAG workflow:
-    1. Accepts documents/text chunks
-    2. Converts them to vector embeddings
-    3. Stores in FAISS vector database
-    4. Retrieves relevant documents based on queries
-    
-    Attributes:
-        vectorstore_path (str): Path to store FAISS index
-        chunk_size (int): Size of text chunks in characters
-        chunk_overlap (int): Overlap between chunks
-        top_k (int): Number of documents to retrieve
-        embeddings: HuggingFace embeddings model
-        vectorstore: FAISS vector store instance
-    """
-    
+class RAGPipelineLCEL:
+    """Retrieval-Augmented Generation Pipeline using LCEL."""
+
     def __init__(
         self,
-        vectorstore_path: str = "./vectorstore",
-        chunk_size: int = 500,
-        chunk_overlap: int = 100,
-        top_k: int = 5,
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+        vectorstore_path: str = DEFAULT_VECTORSTORE_PATH,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+        top_k: int = DEFAULT_TOP_K,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        llm_model: str = "gpt-3.5-turbo",
+        use_openai: bool = True,
+        use_token_splitter: bool = False,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
     ):
-        """
-        Initialize the RAG Pipeline.
-        
-        Args:
-            vectorstore_path: Directory to save/load FAISS index
-            chunk_size: Characters per chunk (how to split documents)
-            chunk_overlap: Characters overlap between chunks (for context)
-            top_k: How many documents to retrieve per query
-            embedding_model: HuggingFace model for embeddings
-        """
         self.vectorstore_path = vectorstore_path
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.top_k = top_k
         self.embedding_model_name = embedding_model
-        
-        # Initialize embeddings
-        logger.info(f"Loading embedding model: {embedding_model}")
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=embedding_model,
-            model_kwargs={"device": "cpu"}  # or "cuda" if GPU available
+        self.llm_model = llm_model
+        self.use_openai = use_openai
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.use_token_splitter = use_token_splitter and TokenTextSplitter_available
+
+        logger.info(
+            f"Initializing RAGPipelineLCEL: "
+            f"embedding_model={embedding_model}, "
+            f"llm_model={llm_model}, "
+            f"use_openai={use_openai}"
         )
-        
-        # Initialize empty vectorstore
+
+        self.device = self._detect_device()
+        logger.info(f"✅ Using device: {self.device}")
+
+        self.embeddings = self._initialize_embeddings()
+        self.llm = self._initialize_llm()
+
         self.vectorstore: Optional[FAISS] = None
-        
-        logger.info("RAG Pipeline initialized successfully")
-    
-    # ========================================================================
-    # DOCUMENT MANAGEMENT
-    # ========================================================================
-    
+        self.retriever = None
+        self.rag_chain = None
+
+        logger.info("✅ RAGPipelineLCEL initialized")
+
+    def _detect_device(self) -> str:
+        """Detect device."""
+        if torch_available and torch.cuda.is_available():
+            device = "cuda"
+            logger.info(f"[Device] CUDA available: {torch.cuda.get_device_name(0)}")
+        else:
+            device = "cpu"
+            logger.info("[Device] Using CPU")
+        return device
+
+    def _initialize_embeddings(self) -> HuggingFaceEmbeddings:
+        """Initialize embeddings."""
+        try:
+            logger.info(f"[Embeddings] Loading: {self.embedding_model_name}")
+            embeddings = HuggingFaceEmbeddings(
+                model_name=self.embedding_model_name,
+                model_kwargs={"device": self.device},
+                cache_folder=os.path.join(DEFAULT_DATA_DIR, ".cache"),
+            )
+            logger.info(f"✅ [Embeddings] Loaded")
+            return embeddings
+        except Exception as e:
+            logger.error(f"❌ [Embeddings] Failed: {str(e)}")
+            raise
+
+    def _initialize_llm(self) -> Any:
+        """Initialize LLM."""
+        try:
+            if self.use_openai:
+                logger.info(f"[LLM] Loading OpenAI: {self.llm_model}")
+                llm = ChatOpenAI(
+                    model_name=self.llm_model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    api_key=os.getenv("OPENAI_API_KEY"),
+                )
+            else:
+                logger.info(f"[LLM] Loading HuggingFace: {self.llm_model}")
+                llm = HuggingFacePipeline(
+                    model_id=self.llm_model,
+                    model_kwargs={
+                        "temperature": self.temperature,
+                        "max_length": self.max_tokens,
+                    },
+                    pipeline_kwargs={
+                        "max_new_tokens": self.max_tokens,
+                    }
+                )
+            logger.info(f"✅ [LLM] Loaded")
+            return llm
+        except Exception as e:
+            logger.error(f"❌ [LLM] Failed: {str(e)}")
+            raise
+
     def add_documents(
         self,
         documents: List[str],
-        metadata: Optional[List[Dict]] = None
+        metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
-        """
-        Add documents to the vector store.
-        
-        Args:
-            documents: List of text chunks to add
-            metadata: Optional metadata for each document (e.g., source, page)
-            
-        Returns:
-            bool: True if successful, False otherwise
-            
-        Example:
-            >>> chunks = ["Document text 1", "Document text 2"]
-            >>> meta = [{"source": "file1.pdf"}, {"source": "file1.pdf"}]
-            >>> pipeline.add_documents(chunks, meta)
-        """
-        try:
-            if not documents:
-                logger.warning("No documents to add")
-                return False
-            
-            logger.info(f"Adding {len(documents)} documents to vector store")
-            
-            # Create LangChain Document objects
-            docs = []
-            for i, doc in enumerate(documents):
-                meta = metadata[i] if metadata and i < len(metadata) else {}
-                docs.append(Document(page_content=doc, metadata=meta))
-            
-            # Create or update vectorstore
-            if self.vectorstore is None:
-                logger.info("Creating new vector store")
-                self.vectorstore = FAISS.from_documents(docs, self.embeddings)
-            else:
-                logger.info("Adding to existing vector store")
-                self.vectorstore.add_documents(docs)
-            
-            logger.info(f"Successfully added {len(documents)} documents")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error adding documents: {str(e)}")
+        """Add documents."""
+        if not documents:
+            logger.warning("add_documents called with empty list")
             return False
-    
+
+        try:
+            logger.info(f"[Documents] Adding {len(documents)} documents")
+            doc_objects = []
+            for i, text in enumerate(documents):
+                meta = metadata[i] if metadata and i < len(metadata) else {}
+                doc_objects.append(Document(page_content=text, metadata=meta))
+
+            chunks = self._chunk_documents(doc_objects)
+            logger.info(f"[Documents] Split into {len(chunks)} chunks")
+
+            if self.vectorstore is None:
+                logger.info("[Vectorstore] Creating new FAISS index")
+                self.vectorstore = FAISS.from_documents(chunks, self.embeddings)
+            else:
+                logger.info("[Vectorstore] Adding to existing index")
+                self.vectorstore.add_documents(chunks)
+
+            self._build_retriever()
+            logger.info(f"✅ [Documents] Added {len(documents)} documents")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ [Documents] Error: {str(e)}")
+            return False
+
+    def _chunk_documents(self, documents: List[Document]) -> List[Document]:
+        """Split documents."""
+        if self.use_token_splitter and TokenTextSplitter_available:
+            logger.info("[Splitter] Using TokenTextSplitter")
+            splitter = TokenTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+            )
+        else:
+            logger.info("[Splitter] Using RecursiveCharacterTextSplitter")
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+                separators=["\n\n", "\n", ". ", " ", ""],
+            )
+
+        chunks = splitter.split_documents(documents)
+        logger.info(f"[Splitter] Created {len(chunks)} chunks")
+        return chunks
+
+    def _build_retriever(self):
+        """Build retriever."""
+        if self.vectorstore is None:
+            logger.warning("Cannot build retriever: vectorstore is None")
+            self.retriever = None
+            return
+
+        self.retriever = self.vectorstore.as_retriever(
+            search_kwargs={"k": self.top_k}
+        )
+        logger.info(f"✅ [Retriever] Built (top_k={self.top_k})")
+
     def retrieve(
         self,
         query: str,
         top_k: Optional[int] = None,
-        filters: Optional[Dict] = None
-    ) -> List[Dict]:
-        """
-        Retrieve relevant documents based on query.
-        
-        Args:
-            query: User's search query (natural language)
-            top_k: Override default number of results to return
-            filters: Optional filters (not implemented in basic FAISS)
-            
-        Returns:
-            List of retrieved documents with content and metadata
-            
-        Example:
-            >>> results = pipeline.retrieve("What is machine learning?", top_k=3)
-            >>> for result in results:
-            ...     print(result['content'])
-            ...     print(result['metadata'])
-        """
+    ) -> List[Dict[str, Any]]:
+        """Retrieve documents."""
         if self.vectorstore is None:
-            logger.warning("Vector store is empty, no documents to retrieve")
+            logger.warning("[Retrieval] Vectorstore is empty")
             return []
-        
+
+        k = top_k if top_k is not None else self.top_k
+
         try:
-            k = top_k if top_k else self.top_k
-            logger.info(f"Retrieving {k} documents for query: {query[:50]}...")
-            
-            # Search vector store using similarity search
-            results = self.vectorstore.similarity_search_with_score(query, k=k)
-            
-            # Format results
-            retrieved_docs = []
-            for doc, score in results:
-                retrieved_docs.append({
+            logger.debug(f"[Retrieval] Searching: {query[:50]}...")
+            hits = self.vectorstore.similarity_search_with_score(query, k=k)
+
+            results = []
+            for doc, score in hits:
+                results.append({
                     "content": doc.page_content,
                     "metadata": doc.metadata,
-                    "score": float(score)  # Lower score = more similar
+                    "score": float(score),
                 })
+
+            logger.info(f"[Retrieval] Found {len(results)} documents")
+            return results
+
+        except Exception as e:
+            logger.error(f"❌ [Retrieval] Error: {str(e)}")
+            return []
+
+    def search(self, query: str, top_k: int = 5) -> List[str]:
+        """Search."""
+        results = self.retrieve(query, top_k)
+        return [r["content"] for r in results]
+
+    def build_rag_chain(self, system_prompt: Optional[str] = None) -> bool:
+        """Build RAG chain."""
+        if self.retriever is None:
+            logger.error("[Chain] Cannot build: no retriever")
+            return False
+
+        try:
+            logger.info("[Chain] Building RAG chain")
+
+            if system_prompt is None:
+                system_prompt = (
+                    "You are a helpful assistant. Use the provided context to answer questions.\n\n"
+                    "Context:\n{context}\n\n"
+                    "Question: {question}\n\n"
+                    "Answer:"
+                )
+
+            prompt = ChatPromptTemplate.from_template(system_prompt)
+
+            def format_docs(docs: List[Document]) -> str:
+                if not docs:
+                    return "No relevant documents found."
+                return "\n\n---\n\n".join(
+                    getattr(d, "page_content", str(d)) for d in docs
+                )
+
+            # ✅ ONLY USE safe_output_parser, NOTHING ELSE
+            self.rag_chain = (
+                {
+                    "context": self.retriever | RunnableLambda(format_docs),
+                    "question": RunnablePassthrough(),
+                }
+                | prompt
+                | self.llm
+                | RunnableLambda(safe_output_parser)
+            )
+
+            logger.info("✅ [Chain] RAG chain built successfully")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ [Chain] Error: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
+
+    def query_with_chain(self, question: str) -> str:
+        """Query with chain."""
+        if self.rag_chain is None:
+            logger.error("[Query] RAG chain not initialized")
+            return "Error: RAG chain not initialized"
+
+        try:
+            logger.info(f"[Query] Processing: {question[:50]}...")
+            response = self.rag_chain.invoke({"question": question})
             
-            logger.info(f"Retrieved {len(retrieved_docs)} documents")
-            return retrieved_docs
+            if not isinstance(response, str):
+                response = str(response)
+            
+            logger.info("[Query] Response generated")
+            return response.strip()
             
         except Exception as e:
-            logger.error(f"Error retrieving documents: {str(e)}")
-            return []
-    
-    def search(self, query: str, top_k: int = 5) -> List[str]:
-        """
-        Simple search function - returns just the text content.
-        
-        Args:
-            query: Search query
-            top_k: Number of results
-            
-        Returns:
-            List of text contents
-            
-        Example:
-            >>> results = pipeline.search("Python programming")
-            >>> print(results[0])  # First result text
-        """
-        docs = self.retrieve(query, top_k)
-        return [doc["content"] for doc in docs]
-    
-    # ========================================================================
-    # PERSISTENCE (Saving/Loading)
-    # ========================================================================
-    
+            logger.error(f"❌ [Query] Error: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return f"Error: {str(e)}"
+
+    def batch_query(self, questions: List[str]) -> List[str]:
+        """Batch query."""
+        if self.rag_chain is None:
+            return ["Error: RAG chain not initialized"] * len(questions)
+
+        logger.info(f"[Batch] Processing {len(questions)} questions")
+        return [self.query_with_chain(q) for q in questions]
+
     def save_vectorstore(self) -> bool:
-        """
-        Save the vector store to disk.
-        
-        Returns:
-            bool: True if successful
-            
-        Example:
-            >>> pipeline.save_vectorstore()
-            True
-        """
+        """Save vectorstore."""
         try:
             if self.vectorstore is None:
-                logger.warning("No vector store to save")
+                logger.warning("[Save] No vectorstore")
                 return False
-            
-            # Create directory if it doesn't exist
+
             Path(self.vectorstore_path).mkdir(parents=True, exist_ok=True)
-            
-            logger.info(f"Saving vector store to {self.vectorstore_path}")
             self.vectorstore.save_local(self.vectorstore_path)
-            
-            logger.info("Vector store saved successfully")
+            logger.info(f"✅ [Save] Saved to {self.vectorstore_path}")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Error saving vector store: {str(e)}")
+            logger.error(f"❌ [Save] Error: {str(e)}")
             return False
-    
+
     def load_vectorstore(self) -> bool:
-        """
-        Load the vector store from disk.
-        
-        Returns:
-            bool: True if successful
-            
-        Example:
-            >>> pipeline.load_vectorstore()
-            True
-        """
+        """Load vectorstore."""
         try:
             if not os.path.exists(self.vectorstore_path):
-                logger.warning(f"Vector store path does not exist: {self.vectorstore_path}")
+                logger.warning(f"[Load] Path not found: {self.vectorstore_path}")
                 return False
-            
-            logger.info(f"Loading vector store from {self.vectorstore_path}")
+
+            logger.info(f"[Load] Loading from {self.vectorstore_path}")
             self.vectorstore = FAISS.load_local(
                 self.vectorstore_path,
-                self.embeddings
+                self.embeddings,
+                allow_dangerous_deserialization=True,
             )
-            
-            logger.info("Vector store loaded successfully")
+            self._build_retriever()
+            logger.info("✅ [Load] Loaded")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Error loading vector store: {str(e)}")
+            logger.error(f"❌ [Load] Error: {str(e)}")
             return False
-    
-    # ========================================================================
-    # UTILITY FUNCTIONS
-    # ========================================================================
-    
+
     def clear_vectorstore(self) -> bool:
-        """
-        Clear the vector store (remove all documents).
-        
-        Returns:
-            bool: True if successful
-            
-        Example:
-            >>> pipeline.clear_vectorstore()
-            True
-        """
+        """Clear vectorstore."""
         try:
-            logger.info("Clearing vector store...")
             self.vectorstore = None
-            
-            # Also delete the saved files
+            self.retriever = None
+            self.rag_chain = None
+
             if os.path.exists(self.vectorstore_path):
-                import shutil
                 shutil.rmtree(self.vectorstore_path)
-                logger.info(f"Deleted vector store directory: {self.vectorstore_path}")
-            
+                logger.info(f"✅ [Clear] Cleared")
+
             return True
-            
+
         except Exception as e:
-            logger.error(f"Error clearing vector store: {str(e)}")
+            logger.error(f"❌ [Clear] Error: {str(e)}")
             return False
-    
-    def get_stats(self) -> Dict:
-        """
-        Get statistics about the vector store.
-        
-        Returns:
-            Dictionary with store information
-            
-        Example:
-            >>> stats = pipeline.get_stats()
-            >>> print(f"Total documents: {stats['num_documents']}")
-        """
-        if self.vectorstore is None:
-            return {
-                "num_documents": 0,
-                "embedding_model": self.embedding_model_name,
-                "chunk_size": self.chunk_size,
-                "status": "empty"
-            }
-        
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get stats."""
         try:
-            # Get index size (approximate number of documents)
-            num_docs = self.vectorstore.index.ntotal
-            
+            if self.vectorstore is None:
+                return {
+                    "status": "empty",
+                    "num_documents": 0,
+                    "embedding_model": self.embedding_model_name,
+                    "llm_model": self.llm_model,
+                    "rag_chain_ready": False,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+
+            num_docs = getattr(self.vectorstore.index, "ntotal", None)
+
             return {
-                "num_documents": num_docs,
+                "status": "active",
+                "num_documents": int(num_docs) if num_docs is not None else 0,
                 "embedding_model": self.embedding_model_name,
-                "chunk_size": self.chunk_size,
-                "chunk_overlap": self.chunk_overlap,
-                "top_k": self.top_k,
-                "status": "active"
+                "llm_model": self.llm_model,
+                "device": self.device,
+                "rag_chain_ready": self.rag_chain is not None,
+                "timestamp": datetime.utcnow().isoformat(),
             }
+
         except Exception as e:
-            logger.error(f"Error getting stats: {str(e)}")
+            logger.error(f"[Stats] Error: {str(e)}")
             return {"status": "error"}
-    
-    def batch_retrieve(
-        self,
-        queries: List[str],
-        top_k: Optional[int] = None
-    ) -> List[List[Dict]]:
-        """
-        Retrieve documents for multiple queries at once.
-        
-        Args:
-            queries: List of queries
-            top_k: Number of results per query
-            
-        Returns:
-            List of result lists
-            
-        Example:
-            >>> queries = ["Query 1", "Query 2"]
-            >>> all_results = pipeline.batch_retrieve(queries)
-        """
-        results = []
-        for query in queries:
-            results.append(self.retrieve(query, top_k))
-        return results
 
+    def split_text(self, text: str) -> List[str]:
+        """Split text."""
+        if self.use_token_splitter and TokenTextSplitter_available:
+            splitter = TokenTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+            )
+        else:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+                separators=["\n\n", "\n", ". ", " ", ""],
+            )
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
+        return splitter.split_text(text)
+
 
 def prepare_context_from_documents(
-    documents: List[Dict],
-    include_metadata: bool = True
+    documents: List[Dict[str, Any]],
+    include_metadata: bool = True,
+    include_scores: bool = False,
 ) -> str:
-    """
-    Prepare a formatted context string from retrieved documents.
-    
-    This is used to create the context that gets passed to the LLM.
-    
-    Args:
-        documents: List of document dicts from retrieve()
-        include_metadata: Whether to include source information
-        
-    Returns:
-        Formatted context string
-        
-    Example:
-        >>> docs = pipeline.retrieve("query")
-        >>> context = prepare_context_from_documents(docs)
-        >>> print(context)
-    """
+    """Format documents."""
     if not documents:
         return "No relevant documents found."
-    
-    context_parts = []
+
+    parts = []
     for i, doc in enumerate(documents, 1):
-        part = f"Document {i}:\n{doc['content']}"
-        
-        if include_metadata and doc.get('metadata'):
-            source = doc['metadata'].get('source', 'Unknown')
+        content = doc.get("content", "")
+        part = f"Document {i}:\n{content}"
+
+        if include_scores:
+            score = doc.get("score", 0)
+            part += f"\n[Relevance: {score:.2f}]"
+
+        if include_metadata and doc.get("metadata"):
+            meta = doc["metadata"]
+            source = meta.get("source", "Unknown")
             part += f"\n[Source: {source}]"
-        
-        context_parts.append(part)
-    
-    return "\n\n---\n\n".join(context_parts)
 
+        parts.append(part)
 
-def split_documents(
-    text: str,
-    chunk_size: int = 500,
-    chunk_overlap: int = 100
-) -> List[str]:
-    """
-    Split a large text into smaller chunks.
-    
-    This is the preprocessing step before adding to vector store.
-    
-    Args:
-        text: Full text to split
-        chunk_size: Size of each chunk
-        chunk_overlap: Overlap between chunks
-        
-    Returns:
-        List of text chunks
-        
-    Example:
-        >>> chunks = split_documents("Large text...", chunk_size=500)
-        >>> print(len(chunks))  # Number of chunks
-    """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap
-    )
-    return splitter.split_text(text)
-# ============================================================================
-# Are you learning or just viewing ? -The End
-# ============================================================================
+    return "\n\n---\n\n".join(parts)

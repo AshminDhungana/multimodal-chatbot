@@ -1,606 +1,503 @@
 """
 Vector Store Module for Multimodel Chatbot
 
-This module manages the FAISS vector database for semantic search.
-It provides:
-- Vector store initialization and management
-- Document storage and retrieval
+This module provides FAISS vector database management with document storage,
+semantic similarity search, and persistence capabilities.
+
+Features:
+- FAISS vector database wrapper
+- GPU/CPU embedding support
+- Document storage with metadata
 - Semantic similarity search
 - Batch operations
 - Persistence (save/load)
-- Index optimization
+- Index management
+- Metadata tracking (created/updated timestamps)
 
-The vector store is the backbone of the RAG system, enabling
-fast semantic search through millions of vectors.
-
+LangChain 1.0.3 Compatible
 """
 
 import os
 import logging
-import pickle
+import shutil
+import json
 from typing import List, Dict, Optional, Tuple, Any
 from pathlib import Path
-import numpy as np
-
-# Third-party imports
-from langchain_community.vectorstores import FAISS
-from langchain.schema import Document
-from langchain_huggingface import HuggingFaceEmbeddings
+from datetime import datetime
 
 # ============================================================================
-# CONFIGURATION
+# LANGCHAIN 1.0.3 IMPORTS (COMPATIBLE)
+# ============================================================================
+
+import numpy as np
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_huggingface import HuggingFaceEmbeddings
+
+# Optional imports
+try:
+    import torch
+    torch_available = True
+except ImportError:
+    torch_available = False
+
+# ============================================================================
+# CONFIGURATION & LOGGING
 # ============================================================================
 
 logger = logging.getLogger(__name__)
 
-# Index type constants
-INDEX_TYPE_FLAT = "flat"           # Exact search
-INDEX_TYPE_IVF = "ivf"             # Approximate search (faster)
-INDEX_TYPE_HNSW = "hnsw"           # Hierarchical search
+# Index types
+INDEX_TYPE_FLAT = "flat"
+INDEX_TYPE_IVF = "ivf"
+INDEX_TYPE_HNSW = "hnsw"
 
+# Load from .env
+DEFAULT_VECTORSTORE_PATH = os.getenv("VECTORSTORE_PATH", "./vectorstore")
+DEFAULT_EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
 
 # ============================================================================
-# VECTOR STORE WRAPPER
+# VECTOR STORE
 # ============================================================================
 
 class VectorStore:
     """
     Wrapper around FAISS vector store for document management.
     
-    This class provides a high-level interface for:
-    - Adding documents to the vector database
-    - Searching for similar documents
-    - Managing the vector index
-    - Persistence operations
-    
-    Attributes:
-        store_path: Directory where index is saved
-        embeddings: Embedding model instance
-        faiss_store: FAISS instance from LangChain
-        metadata: Additional store information
-        document_count: Number of documents in store
+    Provides:
+    - Document addition with metadata
+    - Semantic similarity search
+    - Vector-based search
+    - Persistence (save/load)
+    - Index management
+    - Metadata tracking
     """
-    
+
     def __init__(
         self,
-        store_path: str = "./vectorstore",
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        index_type: str = INDEX_TYPE_FLAT
+        store_path: str = DEFAULT_VECTORSTORE_PATH,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        index_type: str = INDEX_TYPE_FLAT,
+        device: Optional[str] = None,
     ):
         """
-        Initialize Vector Store.
+        Initialize VectorStore.
         
         Args:
-            store_path: Directory to save/load index
+            store_path: Path to store FAISS index
             embedding_model: HuggingFace embedding model
-            index_type: Type of FAISS index
-            
-        Example:
-            >>> store = VectorStore("./vectorstore")
-            >>> store.add_documents(["Text 1", "Text 2"])
-            >>> results = store.search("query")
+            index_type: Type of FAISS index (flat, ivf, hnsw)
+            device: "cpu" or "cuda" (auto-detect if None)
         """
         self.store_path = store_path
         self.index_type = index_type
-        self.faiss_store = None
-        self.document_count = 0
+        self.embedding_model_name = embedding_model
+        self.faiss_store: Optional[FAISS] = None
+        self.document_count: int = 0
+
+        # Detect device
+        if device is None:
+            device = "cuda" if (torch_available and torch.cuda.is_available()) else "cpu"
+        self.device = device
+
+        logger.info(
+            f"✅ [VectorStore] Initializing: path={store_path}, "
+            f"model={embedding_model}, device={device}"
+        )
+
+        # Initialize embeddings
+        try:
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=embedding_model,
+                model_kwargs={"device": device},
+            )
+            logger.info(f"✅ [Embeddings] Loaded: {embedding_model}")
+        except Exception as e:
+            logger.error(f"❌ [Embeddings] Failed to load: {str(e)}")
+            raise
+
+        # Initialize metadata
         self.metadata = {
             "created": None,
             "updated": None,
             "model": embedding_model,
-            "index_type": index_type
+            "index_type": index_type,
+            "device": device,
         }
-        
-        logger.info(f"Initializing VectorStore at {store_path}")
-        
-        # Initialize embeddings
-        logger.info(f"Loading embedding model: {embedding_model}")
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=embedding_model,
-            model_kwargs={"device": "cpu"}
-        )
-        
-        # Create directory if needed
+
+        # Create store path
         Path(store_path).mkdir(parents=True, exist_ok=True)
-        
-        # Try to load existing store
+
+        # Load existing index if available
         if self._index_exists():
+            logger.info("[VectorStore] Existing index found, loading...")
             self.load()
         else:
-            logger.info("No existing index found. Store will be created on first add.")
-    
+            self.metadata["created"] = datetime.now().isoformat()
+            logger.info("[VectorStore] New store initialized")
+
     # ========================================================================
     # INDEX MANAGEMENT
     # ========================================================================
-    
+
     def _index_exists(self) -> bool:
-        """
-        Check if vector store index exists.
-        
-        Returns:
-            bool: True if index files exist
-        """
-        index_file = os.path.join(self.store_path, "index.faiss")
-        return os.path.exists(index_file)
-    
+        """Check if FAISS index exists."""
+        index_path = os.path.join(self.store_path, "index.faiss")
+        return os.path.exists(index_path)
+
     def add_documents(
         self,
         documents: List[str],
-        metadata: Optional[List[Dict]] = None,
-        ids: Optional[List[str]] = None
+        metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """
         Add documents to the vector store.
         
         Args:
-            documents: List of text documents
-            metadata: Optional metadata for each document
-            ids: Optional IDs for documents
+            documents: List of document texts
+            metadata: Optional list of metadata dicts
             
         Returns:
-            bool: True if successful
-            
-        Example:
-            >>> store = VectorStore()
-            >>> docs = ["Hello world", "Machine learning"]
-            >>> meta = [{"source": "file1"}, {"source": "file2"}]
-            >>> store.add_documents(docs, meta)
+            True if successful
         """
-        try:
-            if not documents:
-                logger.warning("No documents to add")
-                return False
-            
-            logger.info(f"Adding {len(documents)} documents to store")
-            
-            # Create LangChain Document objects
-            doc_objects = []
-            for i, doc_text in enumerate(documents):
-                meta = metadata[i] if metadata and i < len(metadata) else {}
-                doc_objects.append(Document(page_content=doc_text, metadata=meta))
-            
-            # Add to FAISS
-            if self.faiss_store is None:
-                logger.info("Creating new FAISS index")
-                self.faiss_store = FAISS.from_documents(
-                    doc_objects,
-                    self.embeddings
-                )
-            else:
-                logger.info("Adding to existing FAISS index")
-                self.faiss_store.add_documents(doc_objects)
-            
-            self.document_count += len(documents)
-            logger.info(f"Successfully added {len(documents)} documents. Total: {self.document_count}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error adding documents: {str(e)}")
+        if not documents:
+            logger.warning("[Add] No documents provided")
             return False
-    
+
+        try:
+            logger.info(f"[Add] Adding {len(documents)} documents")
+
+            # Create Document objects
+            doc_objects = []
+            for i, text in enumerate(documents):
+                meta = metadata[i] if metadata and i < len(metadata) else {}
+                doc_objects.append(Document(page_content=text, metadata=meta))
+
+            # Add to FAISS store
+            if self.faiss_store is None:
+                logger.info("[Add] Creating new FAISS index")
+                self.faiss_store = FAISS.from_documents(doc_objects, self.embeddings)
+            else:
+                logger.info("[Add] Adding to existing index")
+                self.faiss_store.add_documents(doc_objects)
+
+            # Update count
+            self.document_count = self.faiss_store.index.ntotal
+            self.metadata["updated"] = datetime.now().isoformat()
+
+            logger.info(f"✅ [Add] Total documents: {self.document_count}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ [Add] Error: {str(e)}")
+            return False
+
     def search(
         self,
         query: str,
         top_k: int = 5,
-        score_threshold: float = 0.0
-    ) -> List[Dict]:
+        score_threshold: float = 0.0,
+        return_raw_scores: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
-        Search for similar documents.
-        
-        Args:
-            query: Search query (natural language)
-            top_k: Number of results to return
-            score_threshold: Minimum similarity score (0-1)
-            
-        Returns:
-            List of search results with content and metadata
-            
-        Example:
-            >>> store = VectorStore()
-            >>> results = store.search("What is AI?", top_k=3)
-            >>> for result in results:
-            ...     print(result['content'])
-            ...     print(f"Score: {result['score']}")
-        """
-        try:
-            if self.faiss_store is None:
-                logger.warning("Vector store is empty")
-                return []
-            
-            logger.info(f"Searching for: {query[:50]}...")
-            
-            # Search with scores
-            docs_and_scores = self.faiss_store.similarity_search_with_score(query, k=top_k)
-            
-            # Format results
-            results = []
-            for doc, score in docs_and_scores:
-                # Convert distance to similarity (lower distance = higher similarity)
-                similarity = 1 / (1 + score)
-                
-                if similarity >= score_threshold:
-                    results.append({
-                        "content": doc.page_content,
-                        "metadata": doc.metadata,
-                        "score": float(similarity),
-                        "distance": float(score)
-                    })
-            
-            logger.info(f"Found {len(results)} results")
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error searching: {str(e)}")
-            return []
-    
-    def similarity_search(
-        self,
-        query: str,
-        top_k: int = 5
-    ) -> List[str]:
-        """
-        Simple similarity search returning just text.
+        Semantic search using query text.
         
         Args:
             query: Search query
             top_k: Number of results
+            score_threshold: Minimum similarity score (0-1)
+            return_raw_scores: Return raw distance scores
             
         Returns:
-            List of text contents
-            
-        Example:
-            >>> store = VectorStore()
-            >>> results = store.similarity_search("AI", top_k=2)
-            >>> print(results[0])  # First result text
+            List of search results with scores
         """
-        docs = self.search(query, top_k)
-        return [doc["content"] for doc in docs]
-    
+        if self.faiss_store is None:
+            logger.warning("[Search] Vector store is empty")
+            return []
+
+        try:
+            logger.debug(f"[Search] Query: {query[:50]}...")
+            docs_and_scores = self.faiss_store.similarity_search_with_score(
+                query, k=top_k
+            )
+
+            results = []
+            for doc, distance in docs_and_scores:
+                # Convert distance to similarity (0-1 scale)
+                similarity = 1 / (1 + distance)
+
+                if similarity >= score_threshold:
+                    result = {
+                        "content": doc.page_content,
+                        "metadata": doc.metadata,
+                        "similarity": float(similarity),
+                    }
+
+                    if return_raw_scores:
+                        result["distance"] = float(distance)
+
+                    results.append(result)
+
+            logger.info(f"[Search] Found {len(results)} results")
+            return results
+
+        except Exception as e:
+            logger.error(f"❌ [Search] Error: {str(e)}")
+            return []
+
     def search_by_vector(
         self,
         vector: np.ndarray,
-        top_k: int = 5
-    ) -> List[Dict]:
+        top_k: int = 5,
+        return_raw_scores: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
         Search using a pre-computed embedding vector.
         
-        Useful when you already have embeddings from elsewhere.
-        
         Args:
-            vector: Query embedding vector
+            vector: Embedding vector
             top_k: Number of results
+            return_raw_scores: Return raw distance scores
             
         Returns:
             List of search results
-            
-        Example:
-            >>> store = VectorStore()
-            >>> query_vector = some_embedding  # Pre-computed
-            >>> results = store.search_by_vector(query_vector)
         """
+        if self.faiss_store is None:
+            logger.warning("[SearchVector] Vector store is empty")
+            return []
+
         try:
-            if self.faiss_store is None:
-                logger.warning("Vector store is empty")
-                return []
-            
-            logger.info("Searching by vector")
-            
-            # Get the underlying FAISS index
-            index = self.faiss_store.index
-            
-            # Search (FAISS expects 2D array)
+            logger.debug("[SearchVector] Searching by vector")
+
+            # Reshape if needed
             if vector.ndim == 1:
                 vector = vector.reshape(1, -1)
-            
-            distances, indices = index.search(vector.astype(np.float32), top_k)
-            
-            # Get documents
+
+            # Ensure float32
+            vector = vector.astype(np.float32)
+
+            # Search
+            index = self.faiss_store.index
+            distances, indices = index.search(vector, top_k)
+
             results = []
-            for idx, distance in zip(indices[0], distances[0]):
-                if idx >= 0:  # Valid index
-                    doc = self.faiss_store.docstore.search(str(idx))
-                    similarity = 1 / (1 + distance)
-                    
-                    results.append({
+            docstore_dict = self.faiss_store.docstore._dict
+            docstore_keys = list(docstore_dict.keys())
+
+            for idx, dist in zip(indices[0], distances[0]):
+                if idx >= 0 and idx < len(docstore_keys):
+                    key = docstore_keys[idx]
+                    doc = self.faiss_store.docstore[key]
+
+                    similarity = 1 / (1 + dist)
+                    result = {
                         "content": doc.page_content,
                         "metadata": doc.metadata,
-                        "score": float(similarity),
-                        "distance": float(distance)
-                    })
-            
+                        "similarity": float(similarity),
+                    }
+
+                    if return_raw_scores:
+                        result["distance"] = float(dist)
+
+                    results.append(result)
+
+            logger.info(f"[SearchVector] Found {len(results)} results")
             return results
-            
+
         except Exception as e:
-            logger.error(f"Error searching by vector: {str(e)}")
+            logger.error(f"❌ [SearchVector] Error: {str(e)}")
             return []
-    
+
     def batch_search(
         self,
         queries: List[str],
-        top_k: int = 5
-    ) -> List[List[Dict]]:
+        top_k: int = 5,
+    ) -> List[List[Dict[str, Any]]]:
         """
-        Search for multiple queries.
+        Perform multiple searches.
         
         Args:
-            queries: List of queries
+            queries: List of search queries
             top_k: Results per query
             
         Returns:
             List of result lists
-            
-        Example:
-            >>> store = VectorStore()
-            >>> queries = ["AI", "ML", "DL"]
-            >>> results = store.batch_search(queries)
         """
-        all_results = []
-        for query in queries:
-            results = self.search(query, top_k)
-            all_results.append(results)
-        return all_results
-    
+        logger.info(f"[BatchSearch] Searching {len(queries)} queries")
+        results = [self.search(q, top_k) for q in queries]
+        return results
+
     # ========================================================================
     # PERSISTENCE
     # ========================================================================
-    
+
     def save(self) -> bool:
-        """
-        Save vector store to disk.
-        
-        Returns:
-            bool: True if successful
-            
-        Example:
-            >>> store.add_documents(["text"])
-            >>> store.save()  # Persists to disk
-        """
+        """Save vector store to disk."""
         try:
             if self.faiss_store is None:
-                logger.warning("No store to save")
+                logger.warning("[Save] No store to save")
                 return False
-            
-            logger.info(f"Saving vector store to {self.store_path}")
-            
+
+            logger.info(f"[Save] Saving to {self.store_path}")
+
             # Save FAISS index
             self.faiss_store.save_local(self.store_path)
-            
+
             # Save metadata
             self._save_metadata()
-            
-            logger.info("Vector store saved successfully")
+
+            logger.info("✅ [Save] Vector store saved successfully")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Error saving vector store: {str(e)}")
+            logger.error(f"❌ [Save] Error: {str(e)}")
             return False
-    
+
     def load(self) -> bool:
-        """
-        Load vector store from disk.
-        
-        Returns:
-            bool: True if successful
-            
-        Example:
-            >>> store = VectorStore()
-            >>> store.load()  # Loads from disk
-        """
+        """Load vector store from disk."""
         try:
             if not self._index_exists():
-                logger.warning(f"No index found at {self.store_path}")
+                logger.warning(f"[Load] Index not found at {self.store_path}")
                 return False
-            
-            logger.info(f"Loading vector store from {self.store_path}")
-            
+
+            logger.info(f"[Load] Loading from {self.store_path}")
+
             # Load FAISS index
             self.faiss_store = FAISS.load_local(
                 self.store_path,
-                self.embeddings
+                self.embeddings,
+                allow_dangerous_deserialization=True,
             )
-            
+
             # Load metadata
             self._load_metadata()
-            
-            # Count documents
+
+            # Update count
             self.document_count = self.faiss_store.index.ntotal
-            
-            logger.info(f"Vector store loaded successfully ({self.document_count} documents)")
+
+            logger.info(f"✅ [Load] Loaded with {self.document_count} documents")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Error loading vector store: {str(e)}")
+            logger.error(f"❌ [Load] Error: {str(e)}")
             return False
-    
+
     def _save_metadata(self):
         """Save metadata to JSON file."""
         try:
-            import json
-            metadata_path = os.path.join(self.store_path, "metadata.json")
-            
-            from datetime import datetime
             self.metadata["updated"] = datetime.now().isoformat()
-            
-            with open(metadata_path, 'w') as f:
+            if not self.metadata.get("created"):
+                self.metadata["created"] = datetime.now().isoformat()
+
+            meta_path = os.path.join(self.store_path, "metadata.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(self.metadata, f, indent=2)
-            
-            logger.debug("Metadata saved")
+
+            logger.debug("[Metadata] Saved")
         except Exception as e:
-            logger.warning(f"Could not save metadata: {str(e)}")
-    
+            logger.error(f"❌ [Metadata] Save error: {str(e)}")
+
     def _load_metadata(self):
         """Load metadata from JSON file."""
         try:
-            import json
-            metadata_path = os.path.join(self.store_path, "metadata.json")
-            
-            if os.path.exists(metadata_path):
-                with open(metadata_path, 'r') as f:
+            meta_path = os.path.join(self.store_path, "metadata.json")
+            if os.path.exists(meta_path):
+                with open(meta_path, "r", encoding="utf-8") as f:
                     self.metadata = json.load(f)
-                logger.debug("Metadata loaded")
+                logger.debug("[Metadata] Loaded")
         except Exception as e:
-            logger.warning(f"Could not load metadata: {str(e)}")
-    
+            logger.error(f"⚠️  [Metadata] Load error: {str(e)}")
+
     # ========================================================================
-    # UTILITY FUNCTIONS
+    # MANAGEMENT
     # ========================================================================
-    
+
     def clear(self) -> bool:
-        """
-        Clear all documents from store.
-        
-        Returns:
-            bool: True if successful
-            
-        Example:
-            >>> store.clear()  # Delete all documents
-        """
+        """Clear all documents and delete store."""
         try:
-            logger.info("Clearing vector store")
-            
+            logger.info("[Clear] Clearing vector store")
+
             self.faiss_store = None
             self.document_count = 0
-            
-            # Delete files
+            self.metadata["created"] = None
+            self.metadata["updated"] = None
+
             if os.path.exists(self.store_path):
-                import shutil
                 shutil.rmtree(self.store_path)
-                Path(self.store_path).mkdir(parents=True, exist_ok=True)
-            
-            logger.info("Vector store cleared")
+                logger.info(f"[Clear] Deleted {self.store_path}")
+
+            Path(self.store_path).mkdir(parents=True, exist_ok=True)
+            logger.info("✅ [Clear] Vector store cleared")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Error clearing store: {str(e)}")
+            logger.error(f"❌ [Clear] Error: {str(e)}")
             return False
-    
-    def get_stats(self) -> Dict:
-        """
-        Get store statistics.
-        
-        Returns:
-            Dictionary with stats
-            
-        Example:
-            >>> stats = store.get_stats()
-            >>> print(f"Documents: {stats['document_count']}")
-        """
-        return {
-            "document_count": self.document_count,
-            "store_path": self.store_path,
-            "index_type": self.index_type,
-            "embedding_model": self.metadata.get("model", "unknown"),
-            "created": self.metadata.get("created"),
-            "updated": self.metadata.get("updated"),
-            "is_empty": self.faiss_store is None
-        }
-    
-    def get_document_count(self) -> int:
-        """
-        Get number of documents in store.
-        
-        Returns:
-            int: Document count
-        """
-        if self.faiss_store is None:
-            return 0
-        return self.faiss_store.index.ntotal
-    
-    def delete_documents(self, indices: List[int]) -> bool:
-        """
-        Delete documents by index.
-        
-        Note: FAISS doesn't support efficient deletion.
-        For frequent deletions, consider rebuilding the index.
-        
-        Args:
-            indices: List of document indices to delete
-            
-        Returns:
-            bool: True if successful
-        """
-        try:
-            logger.warning("Document deletion is not efficient in FAISS. Consider rebuilding.")
-            logger.info(f"Marking {len(indices)} documents for deletion")
-            # FAISS deletion is complex - would need to rebuild index
-            # For now, just log warning
-            return False
-        except Exception as e:
-            logger.error(f"Error deleting documents: {str(e)}")
-            return False
-    
-    def is_empty(self) -> bool:
-        """
-        Check if store is empty.
-        
-        Returns:
-            bool: True if empty
-        """
-        return self.faiss_store is None or self.document_count == 0
-    
-    # ========================================================================
-    # ADVANCED OPERATIONS
-    # ========================================================================
-    
+
     def rebuild_index(self) -> bool:
-        """
-        Rebuild the FAISS index.
-        
-        Useful after many deletions or for optimization.
-        
-        Returns:
-            bool: True if successful
-        """
+        """Rebuild FAISS index from documents."""
         try:
-            logger.info("Rebuilding FAISS index")
-            
             if self.faiss_store is None:
-                logger.warning("No store to rebuild")
+                logger.warning("[Rebuild] No store to rebuild")
                 return False
-            
-            # Get all documents
-            all_docs = []
-            for i in range(self.document_count):
-                doc = self.faiss_store.docstore.search(str(i))
-                all_docs.append(doc)
-            
-            # Recreate store
+
+            logger.info("[Rebuild] Rebuilding index")
+
+            # Extract all documents
+            docstore_dict = self.faiss_store.docstore._dict
+            all_docs = [self.faiss_store.docstore[key] for key in docstore_dict.keys()]
+
+            # Rebuild from documents
             self.faiss_store = FAISS.from_documents(all_docs, self.embeddings)
-            
-            logger.info("Index rebuilt successfully")
+            self.metadata["updated"] = datetime.now().isoformat()
+
+            logger.info("✅ [Rebuild] Index rebuilt successfully")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Error rebuilding index: {str(e)}")
+            logger.error(f"❌ [Rebuild] Error: {str(e)}")
             return False
-    
-    def get_index_info(self) -> Dict:
-        """
-        Get detailed index information.
-        
-        Returns:
-            Dictionary with index details
-        """
-        if self.faiss_store is None:
-            return {
-                "status": "empty",
-                "documents": 0,
-                "dimensions": 0
-            }
-        
+
+    # ========================================================================
+    # UTILITIES
+    # ========================================================================
+
+    def is_empty(self) -> bool:
+        """Check if store is empty."""
+        return self.faiss_store is None or self.document_count == 0
+
+    def get_document_count(self) -> int:
+        """Get number of documents."""
+        return self.document_count
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get detailed statistics."""
         try:
-            index = self.faiss_store.index
+            store_size = 0
+            if os.path.exists(self.store_path):
+                for dirpath, _, filenames in os.walk(self.store_path):
+                    for fname in filenames:
+                        fpath = os.path.join(dirpath, fname)
+                        store_size += os.path.getsize(fpath)
+
             return {
-                "status": "loaded",
-                "documents": index.ntotal,
-                "dimensions": index.d,
-                "type": type(index).__name__,
-                "is_trained": index.is_trained
+                "status": "active" if not self.is_empty() else "empty",
+                "document_count": self.document_count,
+                "store_path": self.store_path,
+                "store_size_mb": round(store_size / (1024 * 1024), 2),
+                "embedding_model": self.embedding_model_name,
+                "index_type": self.index_type,
+                "device": self.device,
+                "created": self.metadata.get("created"),
+                "updated": self.metadata.get("updated"),
             }
+
         except Exception as e:
-            logger.error(f"Error getting index info: {str(e)}")
-            return {"status": "error"}
+            logger.error(f"[Stats] Error: {str(e)}")
+            return {"status": "error", "error": str(e)}
 
 
 # ============================================================================
@@ -609,105 +506,116 @@ class VectorStore:
 
 class VectorStoreManager:
     """
-    Manager for multiple vector stores.
+    Manage multiple named vector stores.
     
-    Useful when working with multiple collections of documents.
-    
-    Attributes:
-        stores: Dictionary of named vector stores
-        default_store: Default store for operations
+    Allows creation and management of separate vector stores
+    for different document collections.
     """
-    
+
     def __init__(self, base_path: str = "./vectorstores"):
         """
-        Initialize Vector Store Manager.
+        Initialize VectorStoreManager.
         
         Args:
             base_path: Base directory for all stores
         """
         self.base_path = base_path
         self.stores: Dict[str, VectorStore] = {}
-        self.default_store = None
-        
+        self.default_store: Optional[str] = None
+
         Path(base_path).mkdir(parents=True, exist_ok=True)
-        logger.info(f"VectorStoreManager initialized at {base_path}")
-    
+        logger.info(f"✅ [Manager] Initialized at {base_path}")
+
     def create_store(
         self,
         name: str,
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        set_default: bool = True,
     ) -> VectorStore:
         """
         Create a new named vector store.
         
         Args:
-            name: Name for the store
+            name: Store name
             embedding_model: Embedding model to use
+            set_default: Set as default store
             
         Returns:
             VectorStore instance
-            
-        Example:
-            >>> manager = VectorStoreManager()
-            >>> store = manager.create_store("documents")
-            >>> store.add_documents(["text"])
         """
         try:
             store_path = os.path.join(self.base_path, name)
+            logger.info(f"[Manager] Creating store: {name}")
+
             store = VectorStore(store_path, embedding_model)
             self.stores[name] = store
-            
-            if self.default_store is None:
+
+            if set_default or self.default_store is None:
                 self.default_store = name
-            
-            logger.info(f"Created vector store: {name}")
+                logger.info(f"[Manager] Set default store: {name}")
+
+            logger.info(f"✅ [Manager] Store created: {name}")
             return store
-            
+
         except Exception as e:
-            logger.error(f"Error creating store: {str(e)}")
-            return None
-    
-    def get_store(self, name: str) -> Optional[VectorStore]:
+            logger.error(f"❌ [Manager] Error creating store: {str(e)}")
+            raise
+
+    def get_store(self, name: Optional[str] = None) -> Optional[VectorStore]:
         """
-        Get a named vector store.
+        Get a store by name (or default).
         
         Args:
-            name: Store name
+            name: Store name (uses default if None)
             
         Returns:
             VectorStore instance or None
         """
+        if name is None:
+            name = self.default_store
+
+        if name is None:
+            logger.warning("[Manager] No store specified and no default set")
+            return None
+
         return self.stores.get(name)
-    
+
     def delete_store(self, name: str) -> bool:
         """
-        Delete a named vector store.
+        Delete a store.
         
         Args:
             name: Store name
             
         Returns:
-            bool: True if successful
+            True if successful
         """
         try:
-            if name in self.stores:
-                self.stores[name].clear()
-                del self.stores[name]
-                logger.info(f"Deleted store: {name}")
-                return True
-            return False
+            if name not in self.stores:
+                logger.warning(f"[Manager] Store not found: {name}")
+                return False
+
+            logger.info(f"[Manager] Deleting store: {name}")
+            self.stores[name].clear()
+            del self.stores[name]
+
+            if self.default_store == name:
+                self.default_store = None
+
+            logger.info(f"✅ [Manager] Store deleted: {name}")
+            return True
+
         except Exception as e:
-            logger.error(f"Error deleting store: {str(e)}")
+            logger.error(f"❌ [Manager] Error deleting store: {str(e)}")
             return False
-    
+
     def list_stores(self) -> List[str]:
-        """
-        List all available stores.
-        
-        Returns:
-            List of store names
-        """
+        """Get list of all store names."""
         return list(self.stores.keys())
+
+    def get_stats_all(self) -> Dict[str, Dict[str, Any]]:
+        """Get statistics for all stores."""
+        return {name: store.get_stats() for name, store in self.stores.items()}
 
 
 # ============================================================================
@@ -716,38 +624,36 @@ class VectorStoreManager:
 
 def create_vector_store(
     documents: List[str],
-    store_path: str = "./vectorstore",
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    store_path: str = DEFAULT_VECTORSTORE_PATH,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    save_immediately: bool = True,
 ) -> VectorStore:
     """
-    Create and populate a vector store in one step.
+    Create and populate a vector store.
     
     Args:
-        documents: List of documents to add
-        store_path: Where to save the store
-        embedding_model: Embedding model to use
+        documents: List of document texts
+        store_path: Path to store
+        embedding_model: Embedding model
+        save_immediately: Save after adding documents
         
     Returns:
-        Initialized VectorStore
-        
-    Example:
-        >>> docs = ["Hello", "World"]
-        >>> store = create_vector_store(docs)
-        >>> store.search("greeting")
+        Populated VectorStore
     """
-    try:
-        store = VectorStore(store_path, embedding_model)
-        store.add_documents(documents)
+    logger.info(f"[Helper] Creating store with {len(documents)} documents")
+
+    store = VectorStore(store_path, embedding_model)
+    store.add_documents(documents)
+
+    if save_immediately:
         store.save()
-        return store
-    except Exception as e:
-        logger.error(f"Error creating vector store: {str(e)}")
-        return None
+
+    return store
 
 
 def get_vectorstore_size(store_path: str) -> int:
     """
-    Get size of vector store on disk in bytes.
+    Get total size of vector store in bytes.
     
     Args:
         store_path: Path to store
@@ -756,15 +662,18 @@ def get_vectorstore_size(store_path: str) -> int:
         Size in bytes
     """
     try:
-        total_size = 0
-        for dirpath, dirnames, filenames in os.walk(store_path):
-            for filename in filenames:
-                filepath = os.path.join(dirpath, filename)
-                total_size += os.path.getsize(filepath)
-        return total_size
+        total = 0
+        if os.path.exists(store_path):
+            for dirpath, _, filenames in os.walk(store_path):
+                for fname in filenames:
+                    fpath = os.path.join(dirpath, fname)
+                    total += os.path.getsize(fpath)
+        return total
     except Exception as e:
-        logger.error(f"Error getting store size: {str(e)}")
+        logger.error(f"[Size] Error: {str(e)}")
         return 0
+
+
 # ============================================================================
-# AI is Hard and Easy whats do you think ? -The End
+# END OF MODULE
 # ============================================================================
