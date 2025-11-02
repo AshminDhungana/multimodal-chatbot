@@ -1,5 +1,5 @@
 """
-Multimodal Chatbot with RAG System - Main Application
+Multimodal Chatbot with RAG System - Main Application (FIXED)
 
 This application provides a complete Retrieval-Augmented Generation (RAG)
 chatbot with support for both local and OpenAI models, document ingestion,
@@ -10,7 +10,7 @@ Features:
 - Semantic search with HuggingFace embeddings
 - RAG-powered responses with context
 - Multi-turn conversation support
-- Gradio web interface
+- Gradio web interface with proper message handling
 - Full .env configuration support
 - LangChain 1.0.3 compatible
 
@@ -83,7 +83,6 @@ def safe_import(module_path: str, class_name: str):
         logger.warning(f"⚠️  Failed to load {class_name}: {str(e)}")
         return None
 
-
 # Import components
 logger.info("📦 Importing components...")
 
@@ -143,7 +142,6 @@ def initialize_pipeline() -> Optional[object]:
         logger.error(f"❌ RAG Pipeline initialization failed: {str(e)}")
         return None
 
-
 def initialize_llm_manager() -> Optional[object]:
     """Initialize LLM manager."""
     if not LLMManager:
@@ -164,7 +162,6 @@ def initialize_llm_manager() -> Optional[object]:
         logger.error(f"❌ LLM Manager initialization failed: {str(e)}")
         return None
 
-
 def initialize_conversation_manager() -> Optional[object]:
     """Initialize conversation manager."""
     if not ConversationManager:
@@ -179,7 +176,6 @@ def initialize_conversation_manager() -> Optional[object]:
     except Exception as e:
         logger.error(f"❌ Conversation Manager initialization failed: {str(e)}")
         return None
-
 
 def initialize_document_loader() -> Optional[object]:
     """Initialize document loader."""
@@ -321,13 +317,18 @@ class MultimodalChatbot:
         Process user query and generate response.
         
         Args:
-            user_query: User input
+            user_query: User input (STRING only)
             use_rag: Use RAG context
             verbose: Print debug info
             
         Returns:
             Chatbot response
         """
+        # ✅ VERIFY INPUT IS STRING
+        if not isinstance(user_query, str):
+            logger.error(f"❌ Expected string, got {type(user_query)}")
+            return f"Error: Query must be string, got {type(user_query)}"
+
         if not self.is_ready:
             return "⚠️  Chatbot not fully initialized. Please check the logs."
 
@@ -344,7 +345,8 @@ class MultimodalChatbot:
                     logger.info("🔍 Searching RAG context...")
                 try:
                     response = self.rag_pipeline.query_with_chain(user_query)
-                    self.conversation_manager.add_message(user_query, response)
+                    if self.conversation_manager:
+                        self.conversation_manager.add_message(user_query, response)
                     return response
                 except Exception as e:
                     logger.warning(f"⚠️  RAG query failed, falling back: {str(e)}")
@@ -367,6 +369,8 @@ class MultimodalChatbot:
 
         except Exception as e:
             logger.error(f"❌ Chat error: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return f"❌ Error generating response: {str(e)}"
 
     def get_status(self) -> Dict:
@@ -411,7 +415,7 @@ class MultimodalChatbot:
 # ============================================================================
 
 def launch_gradio(chatbot: MultimodalChatbot):
-    """Launch Gradio web interface."""
+    """Launch Gradio web interface with proper input field."""
     if not gradio_available:
         logger.error("❌ Gradio not available")
         return
@@ -434,32 +438,82 @@ def launch_gradio(chatbot: MultimodalChatbot):
     }
     """
 
-    def chat_fn(message: str) -> str:
-        """Gradio chat function."""
-        return chatbot.chat(message, use_rag=True)
-
     def status_fn() -> str:
         """Get status."""
         status = chatbot.get_status()
+        uptime = status["uptime_seconds"]
+        uptime_str = f"{int(uptime // 60)}m {int(uptime % 60)}s"
+        
         return f"""
         **Status:** {'✅ Ready' if status['is_ready'] else '❌ Not Ready'}
+        
         **Model:** {status['model']}
+        
         **Messages:** {status['messages_processed']}
+        
         **Documents:** {status['documents_added']}
+        
         **RAG:** {'✅ Active' if status['rag_ready'] else '⚠️ Inactive'}
+        
+        **Uptime:** {uptime_str}
         """
 
     def rag_stats_fn() -> str:
         """Get RAG statistics."""
         stats = chatbot.get_rag_stats()
         if not stats:
-            return "RAG Pipeline not available"
+            return "⚠️ RAG Pipeline not available"
         return f"""
         **Status:** {stats.get('status', 'N/A')}
+        
         **Documents:** {stats.get('num_documents', 0)}
+        
         **Model:** {stats.get('embedding_model', 'N/A')}
+        
         **Device:** {stats.get('device', 'N/A')}
         """
+
+    # ✅ KEY FIX: Proper message handling with input field
+    def handle_user_input(message: str, chat_history):
+        """
+        Handle user input and generate response.
+        
+        Args:
+            message: User input string from textbox
+            chat_history: Current chat history as List[List[str, str]]
+            
+        Returns:
+            Updated chat history and empty input field
+        """
+        if not message or not message.strip():
+            return chat_history, ""
+
+        try:
+            user_input = message.strip()
+            logger.info(f"💬 User: {user_input[:50]}...")
+            
+            # ✅ Call chatbot with STRING only
+            response = chatbot.chat(user_input, use_rag=True)
+            
+            logger.info(f"✅ Assistant: {response[:50]}...")
+            
+            # ✅ Append to chat history
+            if chat_history is None:
+                chat_history = []
+            chat_history.append([user_input, response])
+            
+            # Return updated history and clear input
+            return chat_history, ""
+
+        except Exception as e:
+            logger.error(f"❌ Error: {str(e)}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            
+            if chat_history is None:
+                chat_history = []
+            chat_history.append([message, f"❌ Error: {str(e)}"])
+            return chat_history, ""
 
     # Create interface
     with gr.Blocks(css=custom_css, title="🤖 Multimodal Chatbot RAG") as demo:
@@ -468,59 +522,100 @@ def launch_gradio(chatbot: MultimodalChatbot):
         gr.Markdown("# 🤖 Multimodal Chatbot with RAG")
         gr.Markdown(
             "Ask questions and get intelligent answers powered by "
-            "Retrieval-Augmented Generation and large language models."
+            "**Retrieval-Augmented Generation** and large language models."
         )
 
         # Main chat section
         with gr.Row():
             with gr.Column(scale=2):
                 gr.Markdown("## 💬 Chat")
-                chatbot_interface = gr.Chatbot(height=500)
-                message_input = gr.Textbox(
-                    label="Your Question",
-                    placeholder="Ask me anything...",
-                    lines=2,
+                
+                # ✅ Chat display (read-only history)
+                chat_display = gr.Chatbot(
+                    label="Conversation",
+                    height=500,
+                    scale=1
                 )
-                submit_btn = gr.Button("Send", variant="primary")
+                
+                # ✅ User input area - THIS IS KEY!
+                with gr.Row():
+                    message_input = gr.Textbox(
+                        label="Your Message",
+                        placeholder="Type your question here and press Enter or click Send...",
+                        lines=2,
+                        scale=4,
+                        max_lines=10
+                    )
+                    submit_btn = gr.Button(
+                        "Send",
+                        variant="primary",
+                        scale=1
+                    )
 
             with gr.Column(scale=1):
                 gr.Markdown("## 📊 Status")
                 status_output = gr.Markdown()
-                refresh_status_btn = gr.Button("Refresh Status")
+                refresh_status_btn = gr.Button("🔄 Refresh Status", size="sm")
 
                 gr.Markdown("## 📈 RAG Stats")
                 rag_stats_output = gr.Markdown()
-                refresh_rag_btn = gr.Button("Refresh RAG Stats")
+                refresh_rag_btn = gr.Button("🔄 Refresh RAG Stats", size="sm")
 
                 gr.Markdown("## 🎯 Actions")
-                reset_btn = gr.Button("Clear History", variant="secondary")
-                save_btn = gr.Button("Save Conversation")
+                reset_btn = gr.Button("🗑️ Clear History", variant="secondary", size="sm")
+                save_btn = gr.Button("💾 Save Conversation", size="sm")
 
-        # Connect functions
-        def chat_with_history(message, history):
-            history = history or []
-            response = chat_fn(message)
-            history.append([message, response])
-            return history, ""
-
+        # ✅ PROPER EVENT HANDLING
+        
+        # Submit button click
         submit_btn.click(
-            chat_with_history,
-            inputs=[message_input, chatbot_interface],
-            outputs=[chatbot_interface, message_input],
+            handle_user_input,
+            inputs=[message_input, chat_display],
+            outputs=[chat_display, message_input],
+            queue=True
         )
 
+        # Enter key in textbox
         message_input.submit(
-            chat_with_history,
-            inputs=[message_input, chatbot_interface],
-            outputs=[chatbot_interface, message_input],
+            handle_user_input,
+            inputs=[message_input, chat_display],
+            outputs=[chat_display, message_input],
+            queue=True
         )
 
-        refresh_status_btn.click(status_fn, outputs=status_output)
-        refresh_rag_btn.click(rag_stats_fn, outputs=rag_stats_output)
-        reset_btn.click(lambda: (chatbot.reset_conversation(), ""), outputs=[gr.Textbox(visible=False), message_input])
+        # Status refresh
+        refresh_status_btn.click(
+            status_fn,
+            outputs=status_output,
+            queue=False
+        )
+        
+        # RAG stats refresh
+        refresh_rag_btn.click(
+            rag_stats_fn,
+            outputs=rag_stats_output,
+            queue=False
+        )
+        
+        # Clear history
+        def clear_history_fn():
+            chatbot.reset_conversation()
+            return [], ""
+        
+        reset_btn.click(
+            clear_history_fn,
+            outputs=[chat_display, message_input],
+            queue=False
+        )
+        
+        # Save conversation
+        def save_conv_fn():
+            success = chatbot.save_conversation("conversation.json")
+            return "✅ Conversation saved!" if success else "❌ Failed to save"
+        
         save_btn.click(
-            lambda: (chatbot.save_conversation("conversation.json"), "Saved!"),
-            outputs=[gr.Textbox(visible=False), gr.Textbox(visible=False)]
+            save_conv_fn,
+            queue=False
         )
 
     # Launch
@@ -530,7 +625,6 @@ def launch_gradio(chatbot: MultimodalChatbot):
         share=False,
         show_error=True,
     )
-
 
 # ============================================================================
 # MAIN FUNCTION
@@ -593,8 +687,9 @@ def main():
 
     except Exception as e:
         logger.critical(f"❌ Fatal error: {str(e)}")
+        import traceback
+        logger.critical(traceback.format_exc())
         sys.exit(1)
-
 
 # ============================================================================
 # EXECUTION GUARD

@@ -1,3 +1,21 @@
+"""
+RAG Pipeline Module for Multimodel Chatbot
+
+This module implements a complete Retrieval-Augmented Generation (RAG) pipeline
+using LangChain 1.0.3 with LCEL (LangChain Expression Language) composition.
+
+Features:
+- Document ingestion and vector storage (FAISS)
+- Semantic search with HuggingFace embeddings
+- LCEL chain composition for RAG
+- GPU detection and device optimization
+- Token-aware text splitting (if available)
+- Persistence (save/load vectorstore)
+- Batch querying support
+- Comprehensive logging and error handling
+
+LangChain 1.0.3 Compatible - NO StrOutputParser
+"""
 
 import os
 import logging
@@ -57,6 +75,7 @@ def safe_output_parser(output: Any) -> str:
     Only parser needed - handles all response types safely.
     
     This is the ONLY output parser in the entire file.
+    Prevents 'dict' object has no attribute 'replace' errors.
     """
     if isinstance(output, dict):
         for key in ["text", "output", "content", "response", "answer", "result"]:
@@ -91,6 +110,7 @@ class RAGPipelineLCEL:
         temperature: float = 0.7,
         max_tokens: int = 2048,
     ):
+        """Initialize RAG Pipeline."""
         self.vectorstore_path = vectorstore_path
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
@@ -304,7 +324,7 @@ class RAGPipelineLCEL:
                     getattr(d, "page_content", str(d)) for d in docs
                 )
 
-            # ✅ ONLY USE safe_output_parser, NOTHING ELSE
+            # ✅ KEY FIX: Use safe_output_parser ONLY - NO StrOutputParser
             self.rag_chain = (
                 {
                     "context": self.retriever | RunnableLambda(format_docs),
@@ -332,7 +352,7 @@ class RAGPipelineLCEL:
 
         try:
             logger.info(f"[Query] Processing: {question[:50]}...")
-            response = self.rag_chain.invoke({"question": question})
+            response = self.rag_chain.invoke(question)
             
             if not isinstance(response, str):
                 response = str(response)
@@ -480,3 +500,7 @@ def prepare_context_from_documents(
         parts.append(part)
 
     return "\n\n---\n\n".join(parts)
+
+# ============================================================================
+# END OF MODULE -
+# ============================================================================

@@ -33,7 +33,6 @@ from langchain_openai import ChatOpenAI
 from langchain_huggingface import HuggingFaceEndpoint, HuggingFacePipeline
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 # Optional memory imports (graceful fallback)
@@ -84,6 +83,38 @@ DEFAULT_TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
 DEFAULT_MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
 
 # ============================================================================
+# SAFE OUTPUT PARSER (CORE FIX)
+# ============================================================================
+
+def safe_llm_output_parser(output: Any) -> str:
+    """
+    Safely convert LLM output to string, handling dict responses.
+    
+    This is the KEY FIX that prevents 'dict' object has no attribute 'replace' errors.
+    Handles dict, string, and other response types from LLMs.
+    
+    Args:
+        output: Any output from LLM (dict, str, etc)
+        
+    Returns:
+        Clean string output
+    """
+    if isinstance(output, dict):
+        # Try common dict keys where text might be stored
+        for key in ["text", "output", "content", "response", "answer", "result"]:
+            if key in output and output[key]:
+                return str(output[key]).strip()
+        # Use first non-empty value
+        for value in output.values():
+            if value:
+                return str(value).strip()
+        return str(output)
+    elif isinstance(output, str):
+        return output.strip()
+    else:
+        return str(output).strip()
+
+# ============================================================================
 # BASE LLM CHAIN CLASS
 # ============================================================================
 
@@ -119,7 +150,6 @@ class BaseLLMChain(ABC):
     async def abatch_invoke(self, input_list: List[Dict[str, Any]]) -> List[str]:
         """Batch asynchronous invocation."""
         raise NotImplementedError
-
 
 # ============================================================================
 # OPENAI LLM CHAIN
@@ -181,15 +211,16 @@ class OpenAILLMChain(BaseLLMChain):
             raise
 
     def _build_chain(self):
-        """Build LCEL chain: prompt -> llm -> parser."""
+        """Build LCEL chain: prompt -> llm."""
         self.prompt_template = ChatPromptTemplate.from_messages([
             ("system", self.system_prompt),
             ("human", "{input}")
         ])
+        # Use RunnableLambda for safe parsing, NOT StrOutputParser
         self.chain = (
             self.prompt_template
             | self.llm
-            | StrOutputParser()
+            | RunnableLambda(safe_llm_output_parser)
         )
 
     def get_chain(self) -> Any:
@@ -202,7 +233,8 @@ class OpenAILLMChain(BaseLLMChain):
         """Invoke chain synchronously."""
         try:
             result = self.chain.invoke(input_data)
-            return str(result).strip()
+            # Already parsed by safe_llm_output_parser in chain
+            return result if isinstance(result, str) else str(result).strip()
         except Exception as e:
             logger.error(f"[OpenAI] Error invoking chain: {str(e)}")
             raise
@@ -212,7 +244,7 @@ class OpenAILLMChain(BaseLLMChain):
         try:
             if hasattr(self.chain, "ainvoke"):
                 result = await self.chain.ainvoke(input_data)
-                return str(result).strip()
+                return result if isinstance(result, str) else str(result).strip()
             else:
                 # Fallback: run sync in executor
                 loop = asyncio.get_event_loop()
@@ -226,7 +258,7 @@ class OpenAILLMChain(BaseLLMChain):
         try:
             if hasattr(self.chain, "batch"):
                 results = self.chain.batch(input_list)
-                return [str(r).strip() for r in results]
+                return [r if isinstance(r, str) else str(r).strip() for r in results]
             else:
                 return [self.invoke(inp) for inp in input_list]
         except Exception as e:
@@ -238,7 +270,7 @@ class OpenAILLMChain(BaseLLMChain):
         try:
             if hasattr(self.chain, "abatch"):
                 results = await self.chain.abatch(input_list)
-                return [str(r).strip() for r in results]
+                return [r if isinstance(r, str) else str(r).strip() for r in results]
             else:
                 # Fallback: run each invoke in executor
                 loop = asyncio.get_event_loop()
@@ -247,7 +279,6 @@ class OpenAILLMChain(BaseLLMChain):
         except Exception as e:
             logger.error(f"[OpenAI] Error in async batch invoke: {str(e)}")
             raise
-
 
 # ============================================================================
 # HUGGING FACE LLM CHAIN
@@ -342,7 +373,7 @@ class HuggingFaceLLMChain(BaseLLMChain):
             "{system_prompt}\n\nUser: {input}\n\nAssistant:"
         )
 
-        # Compose: inject system_prompt + format + llm + parser
+        # Use RunnableLambda for safe parsing, NOT StrOutputParser
         self.chain = (
             {
                 "system_prompt": RunnableLambda(lambda _: self.system_prompt),
@@ -350,7 +381,7 @@ class HuggingFaceLLMChain(BaseLLMChain):
             }
             | self.prompt_template
             | self.llm
-            | StrOutputParser()
+            | RunnableLambda(safe_llm_output_parser)
         )
 
     def get_chain(self) -> Any:
@@ -367,7 +398,7 @@ class HuggingFaceLLMChain(BaseLLMChain):
             raise RuntimeError("Hugging Face chain not initialized")
         try:
             result = self.chain.invoke(input_data)
-            return str(result).strip()
+            return result if isinstance(result, str) else str(result).strip()
         except Exception as e:
             logger.error(f"[HF] Error invoking chain: {str(e)}")
             raise
@@ -379,7 +410,7 @@ class HuggingFaceLLMChain(BaseLLMChain):
         try:
             if hasattr(self.chain, "ainvoke"):
                 result = await self.chain.ainvoke(input_data)
-                return str(result).strip()
+                return result if isinstance(result, str) else str(result).strip()
             else:
                 loop = asyncio.get_event_loop()
                 return await loop.run_in_executor(None, self.invoke, input_data)
@@ -394,7 +425,7 @@ class HuggingFaceLLMChain(BaseLLMChain):
         try:
             if hasattr(self.chain, "batch"):
                 results = self.chain.batch(input_list)
-                return [str(r).strip() for r in results]
+                return [r if isinstance(r, str) else str(r).strip() for r in results]
             else:
                 return [self.invoke(inp) for inp in input_list]
         except Exception as e:
@@ -408,7 +439,7 @@ class HuggingFaceLLMChain(BaseLLMChain):
         try:
             if hasattr(self.chain, "abatch"):
                 results = await self.chain.abatch(input_list)
-                return [str(r).strip() for r in results]
+                return [r if isinstance(r, str) else str(r).strip() for r in results]
             else:
                 loop = asyncio.get_event_loop()
                 tasks = [loop.run_in_executor(None, self.invoke, inp) for inp in input_list]
@@ -416,7 +447,6 @@ class HuggingFaceLLMChain(BaseLLMChain):
         except Exception as e:
             logger.error(f"[HF] Error in async batch invoke: {str(e)}")
             raise
-
 
 # ============================================================================
 # CONVERSATION MANAGER
@@ -547,7 +577,6 @@ class ConversationManager:
             "max_history": self.max_history,
         }
 
-
 # ============================================================================
 # COMPOSITE CHAIN BUILDER
 # ============================================================================
@@ -629,7 +658,6 @@ class CompositeChainBuilder:
                 RunnableLambda(build_input_with_context)
                 | llm_chain
             )
-
 
 # ============================================================================
 # LLM MANAGER (HIGH-LEVEL API)
@@ -794,7 +822,9 @@ class LLMManager:
         input_text = self._build_input(query, context, conversation)
 
         try:
-            return self.current_chain_instance.invoke({"input": input_text})
+            response = self.current_chain_instance.invoke({"input": input_text})
+            # ✅ PARSE OUTPUT SAFELY
+            return safe_llm_output_parser(response)
         except Exception as e:
             logger.warning(f"[LLMManager] Primary model failed: {str(e)}")
             # Try fallback to local model if hybrid
@@ -804,7 +834,8 @@ class LLMManager:
                         try:
                             logger.info(f"[LLMManager] Trying fallback: {model_name}")
                             self.current_chain_instance = instance
-                            return instance.invoke({"input": input_text})
+                            response = instance.invoke({"input": input_text})
+                            return safe_llm_output_parser(response)  # ✅ PARSE HERE TOO
                         except Exception:
                             continue
             raise
@@ -822,7 +853,9 @@ class LLMManager:
         input_text = self._build_input(query, context, conversation)
 
         try:
-            return await self.current_chain_instance.ainvoke({"input": input_text})
+            response = await self.current_chain_instance.ainvoke({"input": input_text})
+            # ✅ PARSE OUTPUT SAFELY
+            return safe_llm_output_parser(response)
         except Exception as e:
             logger.warning(f"[LLMManager] Primary model failed (async): {str(e)}")
             if self.model_type == "hybrid":
@@ -830,7 +863,8 @@ class LLMManager:
                     if model_name in LOCAL_MODELS:
                         try:
                             self.current_chain_instance = instance
-                            return await instance.ainvoke({"input": input_text})
+                            response = await instance.ainvoke({"input": input_text})
+                            return safe_llm_output_parser(response)  # ✅ PARSE HERE TOO
                         except Exception:
                             continue
             raise
@@ -841,7 +875,9 @@ class LLMManager:
             raise RuntimeError("No model loaded.")
 
         inputs = [{"input": self._build_input(q, context, None)} for q in queries]
-        return self.current_chain_instance.batch_invoke(inputs)
+        responses = self.current_chain_instance.batch_invoke(inputs)
+        # ✅ PARSE EACH OUTPUT
+        return [safe_llm_output_parser(r) for r in responses]
 
     async def abatch_invoke(self, queries: List[str], context: str = "") -> List[str]:
         """Batch invoke asynchronously."""
@@ -849,7 +885,9 @@ class LLMManager:
             raise RuntimeError("No model loaded.")
 
         inputs = [{"input": self._build_input(q, context, None)} for q in queries]
-        return await self.current_chain_instance.abatch_invoke(inputs)
+        responses = await self.current_chain_instance.abatch_invoke(inputs)
+        # ✅ PARSE EACH OUTPUT
+        return [safe_llm_output_parser(r) for r in responses]
 
     def _build_input(
         self,
@@ -893,7 +931,6 @@ class LLMManager:
             "diskcache_enabled": self.use_diskcache,
             "timestamp": datetime.utcnow().isoformat(),
         }
-
 
 # ============================================================================
 # END OF MODULE
