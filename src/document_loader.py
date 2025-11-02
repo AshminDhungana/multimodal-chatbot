@@ -673,3 +673,6 @@ def estimate_chunks(file_size_mb: float, chunk_size: int = 500) -> int:
     # Rough estimate: 1 MB ≈ 1 million characters
     # Each chunk ≈ chunk_size characters
     return int((file_size_mb * 1_000_000) / chunk_size)
+# ============================================================================
+# The End
+# ============================================================================

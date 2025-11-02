@@ -9,10 +9,6 @@ Tests cover:
 - Conversation memory
 
 Run with: pytest tests/test_models.py -v
-
-Author: Your Name
-Date: 2025-11-02
-Version: 1.0.0
 """
 
 import pytest

@@ -765,3 +765,6 @@ def get_vectorstore_size(store_path: str) -> int:
     except Exception as e:
         logger.error(f"Error getting store size: {str(e)}")
         return 0
+# ============================================================================
+# AI is Hard and Easy whats do you think ? -The End
+# ============================================================================
